@@ -1,0 +1,8 @@
+Backup before strict dual-camera align change
+Created: 2026-03-01T14:43:09+07:00
+Files:
+- app/orchestration/mission_orchestrator.py
+- app/config.py
+- app/web/dashboard.py
+- .env
+- .env.example

@@ -1,0 +1,4 @@
+backup_created_at=2026-02-28T22:17:32+07:00
+source=/home/besstsu/Documents/AmazingRobot
+backup_dir=/home/besstsu/Documents/AmazingRobot/backups/pre_align_entry_20260228_221732
+note=pre-align-entry-control-update

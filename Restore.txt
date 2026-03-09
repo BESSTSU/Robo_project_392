@@ -1,0 +1,6 @@
+cd /home/besstsu/Documents/AmazingRobot
+cp -a backups/pre_align_entry_20260228_221732/app .
+cp -a backups/pre_align_entry_20260228_221732/firmware .
+cp -a backups/pre_align_entry_20260228_221732/.env .
+cp -a backups/pre_align_entry_20260228_221732/.env.example .
+cp -a backups/pre_align_entry_20260228_221732/run.sh .
