@@ -8,6 +8,7 @@ Use this file as the first context source when conversation state is compacted.
 - Main runtime is Python, not ROS2.
 - Autonomy uses physical front/rear cameras directly; during mission the dashboard front/rear panels stay fixed to physical front/rear. Camera swap is allowed for idle preview only and must not change mission behavior.
 - `start_mission()` forces camera swap OFF so every mission begins with physical front=front and rear=rear.
+- Idle dashboard preview now throttles YOLO annotation with a short cached frame interval instead of rerunning detection on every MJPEG frame/client.
 - Entry point: `app/main.py`
 - Runtime scripts:
   - `setup_env.sh`
@@ -44,6 +45,10 @@ Use this file as the first context source when conversation state is compacted.
    - after a target is locked and no cached tag exists yet, mission changes to `READING_APRILTAG` and keeps reading there
    - if no AprilTag yet but front camera sees `FaceWoodenbox` or `woodenbox`, the robot stays stopped and keeps waiting for an acceptable tag reading
    - if no front woodenbox is available, fall back to `SEARCHING_TARGET`
+   - service now derives one shared `effective yaw` for each candidate:
+     - use practical solvePnP yaw first
+     - else use a conservative penalized pose yaw
+     - else no yaw, and the candidate is rejected safely
    - if multiple acceptable tags are visible, prefer:
      - tag near `FaceWoodenbox` before `woodenbox` fallback
      - then the most front-facing tag (smaller absolute yaw)
@@ -104,14 +109,17 @@ Use this file as the first context source when conversation state is compacted.
 - If tag is not near `FaceWoodenbox`, mission should reject it and continue waiting when `APRILTAG_ALLOW_WOODENBOX_FALLBACK=0`.
 - If tag is near `FaceWoodenbox` but still too side-facing, mission should reject it and continue waiting.
 - `woodenbox` fallback must also reject side-facing tags using `APRILTAG_WOODENBOX_YAW_DEG`; do not accept side-panel tags just because bearing is near center.
+- Rejection status should describe the best near-candidate and include the effective yaw source/value, not just the first raw candidate.
 
 ## Current triangle-align tuning keys
 - `APRILTAG_TRIANGLE_ALIGN_ENABLED=1`
 - `APRILTAG_TRIANGLE_MAX_MOVE_CM=120.0`
 - `APRILTAG_TRIANGLE_MAX_TURN_DEG=140.0`
+- `APRILTAG_TRIANGLE_SKIP_YAW_ABS_DEG=5.0`
 - startup triangle rotate steps use the same tuning path as dashboard `Rotate By Degrees`
 - startup triangle move step uses the same tuning path as dashboard `Drive By Distance`
 - old triangle pose keys remain in config for compatibility, but the startup yaw-scan triangle does not use them
+- if measured practical yaw (`yaw2`) is already within the skip threshold, startup triangle is skipped entirely
 
 ## Current triangle debug/log behavior
 - Triangle stage can emit:
@@ -123,6 +131,7 @@ Use this file as the first context source when conversation state is compacted.
 - If triangle does not actually execute, status should say why, for example:
   - `Triangle align skipped: no usable AprilTag yaw measurement`
   - `Triangle align skipped: missing approx_dist/yaw measurement`
+  - `Triangle align skipped: yaw already small (... <= ... deg)`
   - `Triangle align skipped: move too large (...)`
   - `Triangle align skipped: turn1 too large (...)`
   - `Triangle align skipped: turn2 too large (...)`
@@ -176,13 +185,21 @@ Use this file as the first context source when conversation state is compacted.
 ## Current planting behavior notes
 - Final close should use `SERVO_PLANT_START_DEG`.
 - Phase-2 down step uses `STEP1_AFTER_BURRIED_DEG`.
+- If `phase1` bottom-limit wait times out and `.env` has `PLANT_BOTTOM_TIMEOUT_CONTINUE=1`, the sequence stops the actuator motion and continues to `phase1 up step` instead of failing the whole cycle.
 - Existing planting sequence should be preserved unless the user explicitly asks to change it.
 
 ## Current rear measurement behavior
 - After 2 plants:
   - first measurement move: `C + PLANT_TO_CAMBACK_POINT_CM`
   - next measurement moves: `DE`
-- There is also a pre-plant rear-size checkpoint before first planting move completes.
+- Rear cabbage measurement now prefers the detection nearest the image center, then larger bbox/confidence, and filters outlier size samples before final median sizing.
+- Automatic pre-plant rear adjust during motion is currently disabled.
+- Rear-size calibration is now intended to be manual from the dashboard:
+  - put a known object under the rear camera
+  - enter the real size in `cm`
+  - press `Calibrate Rear Size`
+  - the system updates runtime `cm_per_px` from the current rear detection
+  - manual rear calibration persists into the next mission start and takes priority over front-AprilTag `cm_per_px`
 
 ## Current important environment values
 - `PLANT_TO_CAMBACK_POINT_CM=46.5`
@@ -212,6 +229,20 @@ bash run.sh
     - `MANUAL_DRIVE_DISTANCE_NORM`
     - `MANUAL_DRIVE_DISTANCE_TIMEOUT_SEC`
     - `MANUAL_DRIVE_DISTANCE_MAX_CM`
+- Dashboard now also has floor-surface presets:
+  - posts `/api/tuning/floor-profile`
+  - runtime presets: `smooth`, `normal`, `rough`
+  - each preset updates together:
+    - approach min/max norm
+    - rear-measure move speed
+    - preplant rear-adjust slow speed
+    - manual drive-by-distance speed
+    - manual rotate min norm
+    - manual rotate max norm
+  - changing individual manual drive speed later marks runtime profile as `custom`
+  - dashboard also has a custom runtime drive-tuning apply action:
+    - posts `/api/tuning/runtime-drive`
+    - lets operator edit the same grouped norms directly from the page without restart
 - Dashboard now has `Rotate By Degrees`:
   - posts `/api/manual/rotate`
   - uses IMU heading from drive ESP32
@@ -222,8 +253,10 @@ bash run.sh
     - `MANUAL_ROTATE_TIMEOUT_SEC=14.0`
     - `MANUAL_ROTATE_HOLD_SAMPLES=2`
     - `MANUAL_ROTATE_GAIN=0.040`
+    - `MANUAL_ROTATE_NORM_MIN=0.16`
     - `MANUAL_ROTATE_NORM_MAX=0.45`
     - `MANUAL_ROTATE_TOLERANCE_DEG=5.0`
+  - runtime floor/custom tuning can change both rotate min/max together so rough floors keep enough end-of-turn torque near target
   - fine-stage config keys remain in `.env`/config for compatibility, but `manual_rotate()` does not use them
 - Dashboard now also has `Measure AprilTag Yaw`:
   - posts `/api/apriltag/yaw`
@@ -234,6 +267,7 @@ bash run.sh
     - compute yaw from the solvePnP practical pose path first, then fall back to pose yaw
   - `/api/status` keeps `selection_mode`, `yaw_source`, `yaw_pose_deg`, and `yaw_practical_deg` for debugging
   - also reports `bearing_x_deg`, `approx_dist_cm`, and sample count in `apriltag_yaw_measurement` on `/api/status`
+  - dashboard `Measure AprilTag Yaw` now uses `timeout_sec=8.0` and `min_samples=2`
 
 ## Sync method commonly used
 ```bash
@@ -266,3 +300,9 @@ rsync -azP \
 - Physical front camera is currently mapped as index `2`.
 - Physical rear camera is currently mapped as index `0`.
 - `.env` should therefore use `FRONT_CAMERA_INDEX=2` and `REAR_CAMERA_INDEX=0`.
+- Dashboard now also has manual rear-size calibration:
+  - posts `/api/rear/calibrate`
+  - uses the physical rear camera while mission is idle
+  - operator enters the real object size in `cm`
+  - runtime rear `cm_per_px` is recalculated from the current rear detection and shown in `/api/status` as `rear_scale`
+  - dashboard can also save the current rear scale to `.env` through `/api/rear/calibrate/save`
