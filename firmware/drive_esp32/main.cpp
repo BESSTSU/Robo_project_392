@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
 
@@ -27,8 +28,15 @@
 // IMU pins / config (BNO055 over I2C)
 // =========================
 #define IMU_SDA 21
+
 #define IMU_SCL 13
-constexpr uint8_t IMU_I2C_ADDR = 0x28;
+constexpr uint8_t IMU_I2C_ADDR_PRIMARY = 0x28;
+constexpr uint8_t IMU_I2C_ADDR_SECONDARY = 0x29;
+constexpr uint32_t IMU_I2C_HZ = 100000;
+constexpr uint32_t IMU_UPDATE_PERIOD_MS = 100;
+constexpr uint32_t IMU_BOOT_SETTLE_MS = 1000;
+constexpr uint32_t IMU_BEGIN_RETRY_MS = 5000;
+constexpr uint32_t IMU_BEGIN_RETRY_DELAY_MS = 200;
 
 // 400 PPR, 4x decode
 constexpr int32_t COUNTS_PER_REV = 1600;
@@ -175,13 +183,17 @@ uint32_t lastCmdMs = 0;
 uint32_t lastTelemMs = 0;
 int32_t lastCountL = 0;
 int32_t lastCountR = 0;
-Adafruit_BNO055 bno = Adafruit_BNO055(55, IMU_I2C_ADDR, &Wire);
+Adafruit_BNO055 bnoPrimary = Adafruit_BNO055(55, IMU_I2C_ADDR_PRIMARY, &Wire);
+Adafruit_BNO055 bnoSecondary = Adafruit_BNO055(55, IMU_I2C_ADDR_SECONDARY, &Wire);
+Adafruit_BNO055* bno = nullptr;
 bool imuConnected = false;
 float imuHeadingDeg = NAN;
 uint8_t imuCalSys = 0;
 uint8_t imuCalGyro = 0;
 uint8_t imuCalAccel = 0;
 uint8_t imuCalMag = 0;
+uint32_t lastImuUpdateMs = 0;
+uint8_t imuI2cAddr = IMU_I2C_ADDR_PRIMARY;
 
 void emitTelemetry(bool forceEmit);
 void updateImu();
@@ -200,7 +212,8 @@ void emitImuStatus() {
     return;
   }
   Serial.printf(
-    "DRV_IMU CONNECTED:1 HEAD_DEG:%.2f CAL_SYS:%u CAL_GYRO:%u CAL_ACCEL:%u CAL_MAG:%u\n",
+    "DRV_IMU CONNECTED:1 ADDR:0x%02X HEAD_DEG:%.2f CAL_SYS:%u CAL_GYRO:%u CAL_ACCEL:%u CAL_MAG:%u\n",
+    imuI2cAddr,
     imuHeadingDeg,
     imuCalSys,
     imuCalGyro,
@@ -323,19 +336,72 @@ void updateImu() {
     return;
   }
 
-  imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
-  imuHeadingDeg = euler.x();
-  bno.getCalibration(&imuCalSys, &imuCalGyro, &imuCalAccel, &imuCalMag);
+  uint32_t now = millis();
+  if ((now - lastImuUpdateMs) < IMU_UPDATE_PERIOD_MS) {
+    return;
+  }
+  lastImuUpdateMs = now;
+
+  float prevHeading = imuHeadingDeg;
+  uint8_t prevCalSys = imuCalSys;
+  uint8_t prevCalGyro = imuCalGyro;
+  uint8_t prevCalAccel = imuCalAccel;
+  uint8_t prevCalMag = imuCalMag;
+
+  sensors_event_t event;
+  bno->getEvent(&event);
+  bno->getCalibration(&imuCalSys, &imuCalGyro, &imuCalAccel, &imuCalMag);
+
+  float candidateHeading = event.orientation.x;
+  bool headingLooksValid = isfinite(candidateHeading) && candidateHeading >= 0.0f && candidateHeading <= 360.0f;
+
+  if (headingLooksValid) {
+    imuHeadingDeg = candidateHeading;
+    return;
+  }
+
+  if (isfinite(prevHeading)) {
+    imuHeadingDeg = prevHeading;
+    imuCalSys = prevCalSys;
+    imuCalGyro = prevCalGyro;
+    imuCalAccel = prevCalAccel;
+    imuCalMag = prevCalMag;
+    return;
+  }
+
+  imuHeadingDeg = headingLooksValid ? candidateHeading : NAN;
 }
 
 void setup() {
   Serial.begin(115200);
 
   Wire.begin(IMU_SDA, IMU_SCL);
-  imuConnected = bno.begin();
+  Wire.setClock(IMU_I2C_HZ);
+  delay(IMU_BOOT_SETTLE_MS);
+
+  uint32_t beginDeadline = millis() + IMU_BEGIN_RETRY_MS;
+  while (!imuConnected && millis() < beginDeadline) {
+    imuConnected = bnoPrimary.begin();
+    if (imuConnected) {
+      bno = &bnoPrimary;
+      imuI2cAddr = IMU_I2C_ADDR_PRIMARY;
+      break;
+    }
+
+    imuConnected = bnoSecondary.begin();
+    if (imuConnected) {
+      bno = &bnoSecondary;
+      imuI2cAddr = IMU_I2C_ADDR_SECONDARY;
+      break;
+    }
+
+    delay(IMU_BEGIN_RETRY_DELAY_MS);
+  }
+
   if (imuConnected) {
-    delay(50);
-    bno.setExtCrystalUse(true);
+    delay(IMU_BOOT_SETTLE_MS);
+    bno->setExtCrystalUse(true);
+    delay(IMU_BOOT_SETTLE_MS);
     updateImu();
   }
 
@@ -352,7 +418,10 @@ void setup() {
   lastTelemMs = millis();
 
   Serial.println("DRV_READY");
-  Serial.printf("DRV_IMU_READY CONNECTED:%d SDA:%d SCL:%d ADDR:0x%02X\n", imuConnected ? 1 : 0, IMU_SDA, IMU_SCL, IMU_I2C_ADDR);
+  Serial.printf(
+    "DRV_IMU_READY CONNECTED:%d SDA:%d SCL:%d ADDR:0x%02X I2C_HZ:%lu\n",
+    imuConnected ? 1 : 0, IMU_SDA, IMU_SCL, imuI2cAddr, (unsigned long)IMU_I2C_HZ
+  );
   emitProto();
   emitHelp();
 }
