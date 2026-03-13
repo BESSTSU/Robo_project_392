@@ -61,7 +61,7 @@ class PlantingSequence:
         status_line = self.actuator.wait_for_status_line(0.45, after_seq=seq_before_status)
         return self.actuator.plant_pos_from_status(status_line)
 
-    def _wait_bottom_limit(self, context: str) -> bool:
+    def _wait_bottom_limit(self, context: str, *, allow_continue_on_timeout: bool = False) -> bool:
         timeout_sec = float(config.ACTUATOR.plant_limit_timeout_sec)
         grace_sec = max(0.0, float(config.ACTUATOR.plant_limit_grace_sec))
         seq_before_down = self.actuator.get_rx_seq()
@@ -130,6 +130,14 @@ class PlantingSequence:
                 time.sleep(0.05)
 
         self.actuator.stop_all()
+        if allow_continue_on_timeout:
+            msg = (
+                f"{context}: wait bottom limit timeout after {timeout_sec + grace_sec:.1f}s "
+                f"(last={self.actuator.last_message}) -> continue sequence"
+            )
+            logger.warning(msg)
+            self._set_status(f"Planting: {context} bottom timeout, continue next step")
+            return True
         return self._fail(
             f"{context}: wait bottom limit timeout after {timeout_sec + grace_sec:.1f}s "
             f"(last={self.actuator.last_message})"
@@ -353,7 +361,10 @@ class PlantingSequence:
 
         self._set_status("Planting: phase1 down")
         # 2) Plant axis down to bottom limit
-        if not self._wait_bottom_limit("phase1"):
+        if not self._wait_bottom_limit(
+            "phase1",
+            allow_continue_on_timeout=bool(config.ACTUATOR.plant_bottom_timeout_continue),
+        ):
             return False
 
         self._set_status("Planting: phase1 up step")

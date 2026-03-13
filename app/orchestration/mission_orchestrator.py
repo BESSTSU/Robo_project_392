@@ -606,13 +606,22 @@ class MissionOrchestrator:
             return False
 
         yaw_deg = measurement.get("yaw_deg")
+        yaw_practical_deg = measurement.get("yaw_practical_deg")
         approx_dist_cm = measurement.get("approx_dist_cm")
         if yaw_deg is None or approx_dist_cm is None:
             self.status_text = "Triangle align skipped: missing approx_dist/yaw measurement"
             return False
 
         yaw_deg = float(yaw_deg)
+        skip_yaw_ref_deg = float(yaw_practical_deg) if yaw_practical_deg is not None else float(yaw_deg)
         approx_dist_cm = float(approx_dist_cm)
+        skip_yaw_abs_deg = max(0.0, float(config.VISION.apriltag_triangle_skip_yaw_abs_deg))
+        if abs(skip_yaw_ref_deg) <= skip_yaw_abs_deg:
+            self.status_text = (
+                f"Triangle align skipped: yaw already small "
+                f"({skip_yaw_ref_deg:+.1f}deg <= {skip_yaw_abs_deg:.1f}deg)"
+            )
+            return False
         move1_cm = abs(approx_dist_cm * math.sin(math.radians(yaw_deg)))
         turn1_deg = (-90.0 - yaw_deg) if yaw_deg < 0.0 else (90.0 - yaw_deg)
         turn2_deg = 90.0 if yaw_deg < 0.0 else -90.0

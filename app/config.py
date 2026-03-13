@@ -146,6 +146,7 @@ class VisionConfig:
     apriltag_triangle_standoff_cm: float = float(os.getenv("APRILTAG_TRIANGLE_STANDOFF_CM", "20.0"))
     apriltag_triangle_max_move_cm: float = float(os.getenv("APRILTAG_TRIANGLE_MAX_MOVE_CM", "120.0"))
     apriltag_triangle_max_turn_deg: float = float(os.getenv("APRILTAG_TRIANGLE_MAX_TURN_DEG", "140.0"))
+    apriltag_triangle_skip_yaw_abs_deg: float = float(os.getenv("APRILTAG_TRIANGLE_SKIP_YAW_ABS_DEG", "10.0"))
     apriltag_triangle_move_norm: float = float(os.getenv("APRILTAG_TRIANGLE_MOVE_NORM", "0.24"))
     apriltag_triangle_turn_timeout_sec: float = float(os.getenv("APRILTAG_TRIANGLE_TURN_TIMEOUT_SEC", "4.0"))
     apriltag_triangle_move_timeout_sec: float = float(os.getenv("APRILTAG_TRIANGLE_MOVE_TIMEOUT_SEC", "8.0"))
@@ -191,6 +192,7 @@ class ActuatorConfig:
     plant_retract_delay_sec: float = float(os.getenv("PLANT_RETRACT_DELAY_SEC", "2.0"))
     plant_limit_timeout_sec: float = float(os.getenv("PLANT_LIMIT_TIMEOUT_SEC", "35.0"))
     plant_limit_grace_sec: float = float(os.getenv("PLANT_LIMIT_GRACE_SEC", "12.0"))
+    plant_bottom_timeout_continue: bool = _env_bool("PLANT_BOTTOM_TIMEOUT_CONTINUE", True)
 
 
 @dataclass(frozen=True)
