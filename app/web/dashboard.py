@@ -60,6 +60,19 @@ class DashboardServer:
             ok, msg = self.orchestrator.set_manual_drive_distance_norm(norm)
             return jsonify({"ok": ok, "message": msg, "norm": norm, "tuning": self.orchestrator.get_runtime_tuning()})
 
+        @self.app.route("/api/tuning/floor-profile", methods=["POST"])
+        def api_tuning_floor_profile():
+            payload = request.get_json(silent=True) or {}
+            profile = payload.get("profile")
+            ok, msg = self.orchestrator.set_floor_profile(profile)
+            return jsonify({"ok": ok, "message": msg, "profile": profile, "tuning": self.orchestrator.get_runtime_tuning()})
+
+        @self.app.route("/api/tuning/runtime-drive", methods=["POST"])
+        def api_tuning_runtime_drive():
+            payload = request.get_json(silent=True) or {}
+            ok, msg = self.orchestrator.set_runtime_drive_tuning(payload)
+            return jsonify({"ok": ok, "message": msg, "tuning": self.orchestrator.get_runtime_tuning()})
+
         @self.app.route("/api/plant/run", methods=["POST"])
         def api_plant_run():
             ok, msg = self.orchestrator.run_planting_process()
@@ -69,6 +82,31 @@ class DashboardServer:
         def api_measure_run():
             ok, msg = self.orchestrator.run_rear_measurement_process()
             return jsonify({"ok": ok, "message": msg})
+
+        @self.app.route("/api/rear/calibrate", methods=["POST"])
+        def api_rear_calibrate():
+            payload = request.get_json(silent=True) or {}
+            actual_cm = payload.get("actual_cm")
+            ok, msg = self.orchestrator.calibrate_rear_measurement(actual_cm)
+            return jsonify(
+                {
+                    "ok": ok,
+                    "message": msg,
+                    "actual_cm": actual_cm,
+                    "rear_scale": self.orchestrator.get_rear_scale_info(),
+                }
+            )
+
+        @self.app.route("/api/rear/calibrate/save", methods=["POST"])
+        def api_rear_calibrate_save():
+            ok, msg = self.orchestrator.save_rear_scale_to_env()
+            return jsonify(
+                {
+                    "ok": ok,
+                    "message": msg,
+                    "rear_scale": self.orchestrator.get_rear_scale_info(),
+                }
+            )
 
         @self.app.route("/api/apriltag/yaw", methods=["POST"])
         def api_apriltag_yaw():
@@ -88,6 +126,7 @@ class DashboardServer:
             snap["camera"] = self.orchestrator.get_camera_info()
             snap["imu"] = self.orchestrator.drive.get_imu_status()
             snap["tuning"] = self.orchestrator.get_runtime_tuning()
+            snap["rear_scale"] = self.orchestrator.get_rear_scale_info()
             return jsonify(snap)
 
         @self.app.route("/api/config")
@@ -211,7 +250,7 @@ class DashboardServer:
       box-shadow: 0 8px 24px rgba(37, 99, 235, 0.24);
     }
     button.stop { background: linear-gradient(180deg, #f87171, #dc2626); box-shadow: 0 8px 24px rgba(220, 38, 38, 0.22); }
-    input {
+    input, select {
       border: 1px solid var(--line);
       border-radius: 10px;
       padding: 10px 12px;
@@ -253,6 +292,31 @@ class DashboardServer:
     .kv { padding: 10px; border-radius: 12px; background: rgba(15, 23, 42, 0.72); border: 1px solid var(--line); }
     .kv .k { color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em; }
     .kv .v { margin-top: 6px; font-size: 1rem; font-weight: 700; word-break: break-word; }
+    .tuning-help {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: -2px 0 12px;
+    }
+    .help-item {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.72);
+      border: 1px solid var(--line);
+    }
+    .help-item .name {
+      color: #e5eefc;
+      font-size: 0.82rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .help-item .desc {
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.35;
+      margin-top: 6px;
+    }
     pre {
       margin: 0;
       white-space: pre-wrap;
@@ -281,6 +345,7 @@ class DashboardServer:
     @media (max-width: 760px) {
       .overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv-grid { grid-template-columns: 1fr; }
+      .tuning-help { grid-template-columns: 1fr; }
       .hero { flex-direction: column; align-items: start; }
     }
   </style>
@@ -300,6 +365,13 @@ class DashboardServer:
       <button onclick="runPlanting()">Run Planting Process</button>
       <button onclick="runRearMeasure()">Measure Cabbage Size</button>
       <button onclick="runAprilTagYaw()">Measure AprilTag Yaw</button>
+    </div>
+
+    <div class="toolbar-tight">
+      <input id="rearActualCm" type="number" min="0.1" step="0.1" value="16.0" placeholder="Actual rear size cm" />
+      <button onclick="calibrateRearSize()">Calibrate Rear Size</button>
+      <button onclick="saveRearScaleToEnv()">Save Rear Scale to .env</button>
+      <div class="subtitle">Put a known object under the rear camera, enter its real size in cm, then apply to update rear `cm/px` for the system.</div>
     </div>
 
     <div class="toolbar">
@@ -326,6 +398,52 @@ class DashboardServer:
       <input id="driveSpeedNorm" type="number" min="0.05" max="1.0" step="0.01" value="0.24" placeholder="Drive speed norm" />
       <button onclick="setDriveSpeedNorm()">Set Drive Speed</button>
       <div class="subtitle">Affects Drive By Distance and triangle move1</div>
+    </div>
+
+    <div class="toolbar-tight">
+      <select id="floorProfile">
+        <option value="smooth">Smooth Floor</option>
+        <option value="normal" selected>Normal Floor</option>
+        <option value="rough">Rough Floor</option>
+      </select>
+      <button onclick="setFloorProfile()">Apply Floor Profile</button>
+      <div class="subtitle">Changes approach, rear-measure, preplant slow zone, manual drive, and rotate min/max together</div>
+    </div>
+
+    <div class="toolbar-tight">
+      <input id="approachMinNorm" type="number" min="0.05" max="1.0" step="0.01" value="0.18" placeholder="Approach min" />
+      <input id="approachMaxNorm" type="number" min="0.05" max="1.0" step="0.01" value="0.45" placeholder="Approach max" />
+      <input id="measureSpeedNorm" type="number" min="0.05" max="1.0" step="0.01" value="0.28" placeholder="Rear measure speed" />
+      <input id="preplantSlowNorm" type="number" min="0.05" max="1.0" step="0.01" value="0.20" placeholder="Preplant slow" />
+      <input id="manualRotateNormMin" type="number" min="0.05" max="1.0" step="0.01" value="0.16" placeholder="Rotate min" />
+      <input id="manualRotateNormMax" type="number" min="0.05" max="1.0" step="0.01" value="0.45" placeholder="Rotate max" />
+      <button onclick="applyCustomDriveTune()">Apply Custom Tune</button>
+    </div>
+    <div class="tuning-help">
+      <div class="help-item">
+        <div class="name">Approach Min</div>
+        <div class="desc">ความเร็วต่ำสุดตอนขับหาเป้าหมายด้านหน้า เพิ่มค่านี้ถ้าหุ่นเริ่มไหลช้าเกินหรือแรงไม่พอบนพื้นฝืด</div>
+      </div>
+      <div class="help-item">
+        <div class="name">Approach Max</div>
+        <div class="desc">เพดานความเร็วตอน approach/search เพิ่มเมื่ออยากให้เข้าหาเป้าหมายเร็วขึ้น แต่ถ้าสูงเกินจะ overshoot ง่าย</div>
+      </div>
+      <div class="help-item">
+        <div class="name">Rear Measure Speed</div>
+        <div class="desc">ความเร็ววิ่งช่วงไปจุดวัดด้านหลัง ลดลงถ้ากล้องหลังจับไม่ทัน เพิ่มขึ้นถ้าระบบช้าเกินโดยที่ยังเห็นภาพทัน</div>
+      </div>
+      <div class="help-item">
+        <div class="name">Preplant Slow</div>
+        <div class="desc">ความเร็วชะลอในโซนรอ rear AprilTag ก่อน adjust ค่านี้ต่ำลงจะช่วยให้ไม่วิ่งเลย tag ตอน FPS น้อย</div>
+      </div>
+      <div class="help-item">
+        <div class="name">Rotate Min</div>
+        <div class="desc">แรงหมุนขั้นต่ำตอนใกล้เป้าหมาย ใช้แก้อาการหมุนท้ายไม่ไปต่อหรือ timeout บนพื้นหยาบ</div>
+      </div>
+      <div class="help-item">
+        <div class="name">Rotate Max</div>
+        <div class="desc">เพดานแรงหมุนทั้งหมด เพิ่มเมื่อพื้นใหม่กินแรงมาก แต่ถ้าสูงเกินจะสะบัดหรือหมุนเลยเป้าได้</div>
+      </div>
     </div>
 
     <div class="overview">
@@ -414,6 +532,26 @@ class DashboardServer:
       if (!data.ok) console.error('rear measure failed:', data.message);
     }
 
+    async function calibrateRearSize() {
+      const el = document.getElementById('rearActualCm');
+      const actual_cm = Number(el.value);
+      const r = await fetch('/api/rear/calibrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actual_cm })
+      });
+      const data = await r.json();
+      if (!data.ok) console.error('rear calibration failed:', data.message);
+      await refresh();
+    }
+
+    async function saveRearScaleToEnv() {
+      const r = await fetch('/api/rear/calibrate/save', { method: 'POST' });
+      const data = await r.json();
+      if (!data.ok) console.error('save rear scale failed:', data.message);
+      await refresh();
+    }
+
     async function runAprilTagYaw() {
       const r = await fetch('/api/apriltag/yaw', { method: 'POST' });
       const data = await r.json();
@@ -456,6 +594,39 @@ class DashboardServer:
       });
       const data = await r.json();
       if (!data.ok) console.error('set drive speed failed:', data.message);
+      await refresh();
+    }
+
+    async function setFloorProfile() {
+      const el = document.getElementById('floorProfile');
+      const profile = String(el.value || 'normal');
+      const r = await fetch('/api/tuning/floor-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile })
+      });
+      const data = await r.json();
+      if (!data.ok) console.error('set floor profile failed:', data.message);
+      await refresh();
+    }
+
+    async function applyCustomDriveTune() {
+      const payload = {
+        approach_min_norm: Number(document.getElementById('approachMinNorm').value),
+        approach_max_norm: Number(document.getElementById('approachMaxNorm').value),
+        move_to_measure_speed_norm: Number(document.getElementById('measureSpeedNorm').value),
+        preplant_adjust_slow_norm: Number(document.getElementById('preplantSlowNorm').value),
+        manual_drive_distance_norm: Number(document.getElementById('driveSpeedNorm').value),
+        manual_rotate_norm_min: Number(document.getElementById('manualRotateNormMin').value),
+        manual_rotate_norm_max: Number(document.getElementById('manualRotateNormMax').value),
+      };
+      const r = await fetch('/api/tuning/runtime-drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (!data.ok) console.error('apply custom drive tune failed:', data.message);
       await refresh();
     }
 
@@ -535,6 +706,9 @@ class DashboardServer:
       ctx.moveTo(20, h/2);
       ctx.lineTo(w-20, h/2);
       ctx.stroke();
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '11px monospace';
+      ctx.fillText('distance', 24, h/2 - 14);
 
       if (!points || points.length === 0) return;
       const items = points.slice(-40);
@@ -553,6 +727,11 @@ class DashboardServer:
         ctx.fillStyle = '#cbd5e1';
         ctx.font = '11px monospace';
         ctx.fillText(String(p.idx ?? idx+1), x-4, h/2 - 10);
+        const sizeText = (p.size_cm === null || p.size_cm === undefined)
+          ? 'n/a'
+          : `${Number(p.size_cm).toFixed(1)} cm`;
+        ctx.fillStyle = ok ? '#86efac' : '#fca5a5';
+        ctx.fillText(sizeText, x - 18, h/2 + 22);
       });
     }
 
@@ -581,6 +760,8 @@ class DashboardServer:
           ['Target', data.target_class || '-'],
           ['Camera', `front=${data.camera?.effective_front_source || '-'} rear=${data.camera?.effective_rear_source || '-'}`],
           ['Drive RPM', `L ${fmt(data.drive?.left_rpm)} / R ${fmt(data.drive?.right_rpm)}`],
+          ['Rear Scale', data.rear_scale?.cm_per_px ? `${fmt(data.rear_scale.cm_per_px)} (${data.rear_scale.source || '-'})` : '-'],
+          ['Floor Profile', data.tuning?.floor_profile || '-'],
           ['Drive Speed', fmt(data.tuning?.manual_drive_distance_norm)],
           ['IMU', data.imu?.connected ? `heading ${fmt(data.imu?.heading_deg, ' deg')}` : 'not connected'],
           ['AprilTag Pose', data.apriltag_yaw_measurement ? `yaw ${fmt(data.apriltag_yaw_measurement.yaw_practical_deg ?? data.apriltag_yaw_measurement.yaw_deg, ' deg')}` : 'no measurement'],
@@ -589,6 +770,34 @@ class DashboardServer:
         const driveSpeedEl = document.getElementById('driveSpeedNorm');
         if (driveSpeedEl && document.activeElement !== driveSpeedEl && data.tuning?.manual_drive_distance_norm !== undefined) {
           driveSpeedEl.value = Number(data.tuning.manual_drive_distance_norm).toFixed(2);
+        }
+        const approachMinEl = document.getElementById('approachMinNorm');
+        if (approachMinEl && document.activeElement !== approachMinEl && data.tuning?.approach_min_norm !== undefined) {
+          approachMinEl.value = Number(data.tuning.approach_min_norm).toFixed(2);
+        }
+        const approachMaxEl = document.getElementById('approachMaxNorm');
+        if (approachMaxEl && document.activeElement !== approachMaxEl && data.tuning?.approach_max_norm !== undefined) {
+          approachMaxEl.value = Number(data.tuning.approach_max_norm).toFixed(2);
+        }
+        const measureSpeedEl = document.getElementById('measureSpeedNorm');
+        if (measureSpeedEl && document.activeElement !== measureSpeedEl && data.tuning?.move_to_measure_speed_norm !== undefined) {
+          measureSpeedEl.value = Number(data.tuning.move_to_measure_speed_norm).toFixed(2);
+        }
+        const preplantSlowEl = document.getElementById('preplantSlowNorm');
+        if (preplantSlowEl && document.activeElement !== preplantSlowEl && data.tuning?.preplant_adjust_slow_norm !== undefined) {
+          preplantSlowEl.value = Number(data.tuning.preplant_adjust_slow_norm).toFixed(2);
+        }
+        const rotateMinEl = document.getElementById('manualRotateNormMin');
+        if (rotateMinEl && document.activeElement !== rotateMinEl && data.tuning?.manual_rotate_norm_min !== undefined) {
+          rotateMinEl.value = Number(data.tuning.manual_rotate_norm_min).toFixed(2);
+        }
+        const rotateNormEl = document.getElementById('manualRotateNormMax');
+        if (rotateNormEl && document.activeElement !== rotateNormEl && data.tuning?.manual_rotate_norm_max !== undefined) {
+          rotateNormEl.value = Number(data.tuning.manual_rotate_norm_max).toFixed(2);
+        }
+        const floorProfileEl = document.getElementById('floorProfile');
+        if (floorProfileEl && document.activeElement !== floorProfileEl && data.tuning?.floor_profile) {
+          floorProfileEl.value = String(data.tuning.floor_profile);
         }
 
         const core = {

@@ -93,6 +93,12 @@ class VisionConfig:
     pre_april_bbox_tolerance_px: int = int(os.getenv("PRE_APRIL_BBOX_TOLERANCE_PX", "10"))
     pre_april_adjust_norm: float = float(os.getenv("PRE_APRIL_ADJUST_NORM", "0.18"))
     pre_april_adjust_timeout_sec: float = float(os.getenv("PRE_APRIL_ADJUST_TIMEOUT_SEC", "6.0"))
+    preplant_adjust_apriltag_pause_sec: float = float(os.getenv("PREPLANT_ADJUST_APRILTAG_PAUSE_SEC", "0.35"))
+    preplant_adjust_search_lead_cm: float = float(os.getenv("PREPLANT_ADJUST_SEARCH_LEAD_CM", "15.0"))
+    preplant_adjust_slow_norm: float = float(os.getenv("PREPLANT_ADJUST_SLOW_NORM", "0.20"))
+    preplant_adjust_extend_after_second_leg_cm: float = float(
+        os.getenv("PREPLANT_ADJUST_EXTEND_AFTER_SECOND_LEG_CM", "20.0")
+    )
 
     # Stuck detection + recovery
     stuck_window_sec: float = float(os.getenv("STUCK_WINDOW_SEC", "1.2"))
@@ -160,6 +166,7 @@ class VisionConfig:
     manual_drive_distance_norm: float = float(os.getenv("MANUAL_DRIVE_DISTANCE_NORM", "0.24"))
     manual_drive_distance_timeout_sec: float = float(os.getenv("MANUAL_DRIVE_DISTANCE_TIMEOUT_SEC", "12.0"))
     manual_drive_distance_max_cm: float = float(os.getenv("MANUAL_DRIVE_DISTANCE_MAX_CM", "150.0"))
+    idle_preview_interval_sec: float = float(os.getenv("IDLE_PREVIEW_INTERVAL_SEC", "0.20"))
 
 
 @dataclass(frozen=True)
@@ -205,6 +212,7 @@ class ImuConfig:
     manual_rotate_timeout_sec: float = float(os.getenv("MANUAL_ROTATE_TIMEOUT_SEC", "12.0"))
     manual_rotate_hold_samples: int = int(os.getenv("MANUAL_ROTATE_HOLD_SAMPLES", "1"))
     manual_rotate_gain: float = float(os.getenv("MANUAL_ROTATE_GAIN", "0.040"))
+    manual_rotate_norm_min: float = float(os.getenv("MANUAL_ROTATE_NORM_MIN", "0.16"))
     manual_rotate_norm_max: float = float(os.getenv("MANUAL_ROTATE_NORM_MAX", "0.45"))
     manual_rotate_tolerance_deg: float = float(os.getenv("MANUAL_ROTATE_TOLERANCE_DEG", "8.0"))
     manual_rotate_fine_band_deg: float = float(os.getenv("MANUAL_ROTATE_FINE_BAND_DEG", "0.0"))

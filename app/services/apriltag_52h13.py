@@ -43,7 +43,7 @@ class AprilTag52h13Service:
             try:
                 self.detector = Detector(
                     families="tagStandard52h13",
-                    nthreads=4,
+                    nthreads=1,
                     quad_decimate=1.0,
                     quad_sigma=0.0,
                     refine_edges=1,
@@ -69,6 +69,21 @@ class AprilTag52h13Service:
             spacing_gap_cm=spacing,
             cabbage_interval_cm=de,
         )
+
+    @staticmethod
+    def _derive_effective_yaw_deg(
+        practical_yaw_deg: float | None,
+        pose_yaw_deg: float | None,
+        bearing_x_deg: float | None,
+    ) -> tuple[float | None, str]:
+        if practical_yaw_deg is not None:
+            return float(practical_yaw_deg), "practical"
+        if pose_yaw_deg is not None:
+            # pose yaw alone tends to underestimate side-facing tags; keep a conservative penalty.
+            return float(pose_yaw_deg) * 2.5, "pose_penalized"
+        if bearing_x_deg is not None:
+            return float(bearing_x_deg), "bearing_proxy"
+        return None, "none"
 
     def _detect_tag_candidates(
         self, frame: np.ndarray
@@ -156,6 +171,15 @@ class AprilTag52h13Service:
             if practical_pose is not None:
                 robot_forward_cm, robot_lateral_cm, practical_yaw_deg = practical_pose
 
+            effective_yaw_deg, effective_yaw_source = self._derive_effective_yaw_deg(
+                practical_yaw_deg,
+                pose_yaw_deg,
+                bearing_x_deg,
+            )
+            front_facing_score = (
+                999.0 if effective_yaw_deg is None else abs(float(effective_yaw_deg))
+            )
+
             metrics = {
                 "tag_side_px": side_px,
                 "tag_center_x_px": center_x,
@@ -172,6 +196,9 @@ class AprilTag52h13Service:
                 "tag_robot_forward_cm": robot_forward_cm,
                 "tag_robot_lateral_cm": robot_lateral_cm,
                 "tag_robot_yaw_practical_deg": practical_yaw_deg,
+                "tag_effective_yaw_deg": effective_yaw_deg,
+                "tag_effective_yaw_source": effective_yaw_source,
+                "tag_front_facing_score": front_facing_score,
             }
             candidates.append((tag, info, metrics))
         return candidates, annotated
@@ -261,13 +288,9 @@ class AprilTag52h13Service:
 
     @staticmethod
     def _candidate_measure_rank(metrics: dict) -> tuple[float, float, float]:
-        practical_yaw = metrics.get("tag_robot_yaw_practical_deg")
-        pose_yaw = metrics.get("tag_pose_yaw_deg")
-        yaw = practical_yaw if practical_yaw is not None else pose_yaw
         bearing_x = metrics.get("tag_bearing_x_deg")
         side_px = float(metrics.get("tag_side_px", 0.0))
-
-        yaw_abs = 999.0 if yaw is None else abs(float(yaw))
+        yaw_abs = float(metrics.get("tag_front_facing_score", 999.0))
         bearing_abs = 999.0 if bearing_x is None else abs(float(bearing_x))
         return (yaw_abs, bearing_abs, -side_px)
 
@@ -323,7 +346,10 @@ class AprilTag52h13Service:
         return tuple(math.degrees(v) for v in (roll, pitch, yaw))
 
     def detect_and_annotate_with_metrics(
-        self, frame: np.ndarray, *, prefer_largest_area: bool = False
+        self,
+        frame: np.ndarray,
+        *,
+        prefer_largest_area: bool = False,
     ) -> tuple[Optional[AprilTagInfo], np.ndarray, Optional[dict]]:
         try:
             candidates, annotated = self._detect_tag_candidates(frame)
@@ -397,7 +423,10 @@ class AprilTag52h13Service:
             return None, annotated, None
 
     def detect_and_annotate(
-        self, frame: np.ndarray, *, prefer_largest_area: bool = False
+        self,
+        frame: np.ndarray,
+        *,
+        prefer_largest_area: bool = False,
     ) -> tuple[Optional[AprilTagInfo], np.ndarray]:
         info, annotated, _ = self.detect_and_annotate_with_metrics(
             frame,

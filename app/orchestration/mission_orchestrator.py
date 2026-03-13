@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -53,6 +54,10 @@ class MissionOrchestrator:
         self._rear_frame_lock = threading.Lock()
         self._front_annotated: np.ndarray | None = None
         self._rear_annotated: np.ndarray | None = None
+        self._front_idle_preview: np.ndarray | None = None
+        self._rear_idle_preview: np.ndarray | None = None
+        self._front_idle_preview_ts = 0.0
+        self._rear_idle_preview_ts = 0.0
 
         self._distance_goal_cm = 0.0
         self._last_servo_step_ts = 0.0
@@ -71,6 +76,8 @@ class MissionOrchestrator:
         self._measure_idx = 0
         self._cm_per_px = float(config.VISION.rear_cm_per_px_default)
         self._cm_per_px_source = "default"
+        self._manual_cm_per_px: float | None = None
+        self._manual_cm_per_px_source: str | None = None
         self._align_hold_count = 0
         self._stuck_ref_ts = 0.0
         self._stuck_ref_dist_cm = 0.0
@@ -79,9 +86,18 @@ class MissionOrchestrator:
         self._plants_done_current_pair = 0
         self._measure_interval_cm = 0.0
         self._preplant_adjust_pending = False
+        self._preplant_adjust_search_start_cm = 0.0
+        self._preplant_adjust_fallback_cm = 0.0
         self._preplant_adjust_goal_cm = 0.0
         self._preapproach_tag_attempted = False
+        self._floor_profile_name = "normal"
+        self._approach_min_norm = float(config.VISION.approach_min_norm)
+        self._approach_max_norm = float(config.VISION.approach_max_norm)
+        self._move_to_measure_speed_norm = float(config.VISION.move_to_measure_speed_norm)
+        self._preplant_adjust_slow_norm = float(config.VISION.preplant_adjust_slow_norm)
         self._manual_drive_distance_norm = float(config.VISION.manual_drive_distance_norm)
+        self._manual_rotate_norm_min = float(config.IMU.manual_rotate_norm_min)
+        self._manual_rotate_norm_max = float(config.IMU.manual_rotate_norm_max)
 
     @staticmethod
     def _point_in_expanded_box(px: float, py: float, det: Detection, scale: float) -> bool:
@@ -93,6 +109,64 @@ class MissionOrchestrator:
 
     def _get_manual_drive_distance_norm(self) -> float:
         return float(self._manual_drive_distance_norm)
+
+    def _get_approach_min_norm(self) -> float:
+        return float(self._approach_min_norm)
+
+    def _get_approach_max_norm(self) -> float:
+        return float(self._approach_max_norm)
+
+    def _get_move_to_measure_speed_norm(self) -> float:
+        return float(self._move_to_measure_speed_norm)
+
+    def _get_preplant_adjust_slow_norm(self) -> float:
+        return float(self._preplant_adjust_slow_norm)
+
+    def get_rear_scale_info(self) -> dict:
+        return {
+            "cm_per_px": float(round(self._cm_per_px, 6)),
+            "source": str(self._cm_per_px_source),
+            "manual_override": self._manual_cm_per_px is not None,
+        }
+
+    def _get_manual_rotate_norm_max(self) -> float:
+        return float(self._manual_rotate_norm_max)
+
+    def _get_manual_rotate_norm_min(self) -> float:
+        return float(self._manual_rotate_norm_min)
+
+    @staticmethod
+    def _build_floor_profile_values() -> dict[str, dict[str, float]]:
+        normal = {
+            "approach_min_norm": float(config.VISION.approach_min_norm),
+            "approach_max_norm": float(config.VISION.approach_max_norm),
+            "move_to_measure_speed_norm": float(config.VISION.move_to_measure_speed_norm),
+            "preplant_adjust_slow_norm": float(config.VISION.preplant_adjust_slow_norm),
+            "manual_drive_distance_norm": float(config.VISION.manual_drive_distance_norm),
+            "manual_rotate_norm_min": float(config.IMU.manual_rotate_norm_min),
+            "manual_rotate_norm_max": float(config.IMU.manual_rotate_norm_max),
+        }
+        return {
+            "smooth": {
+                "approach_min_norm": max(0.05, normal["approach_min_norm"] * 0.90),
+                "approach_max_norm": max(0.08, normal["approach_max_norm"] * 0.90),
+                "move_to_measure_speed_norm": max(0.05, normal["move_to_measure_speed_norm"] * 0.90),
+                "preplant_adjust_slow_norm": max(0.05, normal["preplant_adjust_slow_norm"] * 0.90),
+                "manual_drive_distance_norm": max(0.05, normal["manual_drive_distance_norm"] * 0.90),
+                "manual_rotate_norm_min": max(0.08, normal["manual_rotate_norm_min"] * 0.90),
+                "manual_rotate_norm_max": max(0.10, normal["manual_rotate_norm_max"] * 0.90),
+            },
+            "normal": normal,
+            "rough": {
+                "approach_min_norm": min(1.0, normal["approach_min_norm"] * 1.20),
+                "approach_max_norm": min(1.0, normal["approach_max_norm"] * 1.18),
+                "move_to_measure_speed_norm": min(1.0, normal["move_to_measure_speed_norm"] * 1.20),
+                "preplant_adjust_slow_norm": min(1.0, normal["preplant_adjust_slow_norm"] * 1.20),
+                "manual_drive_distance_norm": min(1.0, normal["manual_drive_distance_norm"] * 1.20),
+                "manual_rotate_norm_min": min(1.0, normal["manual_rotate_norm_min"] * 1.30),
+                "manual_rotate_norm_max": min(1.0, normal["manual_rotate_norm_max"] * 1.15),
+            },
+        }
 
     def _try_read_apriltag_once(self, frame: np.ndarray) -> tuple[AprilTagInfo | None, dict | None, np.ndarray]:
         dets, det_anno = self.detector.detect_all(
@@ -107,7 +181,9 @@ class MissionOrchestrator:
             return None, None, anno
 
         best: tuple[AprilTagInfo, dict, str] | None = None
-        best_rank: tuple[float, float, float] | None = None
+        best_rank: tuple[float, float, float, float, float] | None = None
+        best_reject: tuple[dict, str, str] | None = None
+        best_reject_rank: tuple[float, float, float, float, float] | None = None
         saw_near_face = False
         saw_near_woodenbox = False
         for _, info, metrics in candidates:
@@ -138,9 +214,11 @@ class MissionOrchestrator:
             center_err = float(metrics.get("tag_center_err_norm", 0.0))
             pose_yaw_deg = metrics.get("tag_pose_yaw_deg")
             practical_yaw_deg = metrics.get("tag_robot_yaw_practical_deg")
-            yaw_deg = practical_yaw_deg if practical_yaw_deg is not None else pose_yaw_deg
+            yaw_deg = metrics.get("tag_effective_yaw_deg")
+            yaw_source = str(metrics.get("tag_effective_yaw_source", "none"))
             tag_side_px = float(metrics.get("tag_side_px", 0.0))
             bearing_x_deg = metrics.get("tag_bearing_x_deg")
+            front_score = float(metrics.get("tag_front_facing_score", 999.0))
             if anchor_name == "woodenbox":
                 center_tol = float(config.VISION.apriltag_woodenbox_center_tol_norm)
                 yaw_tol = float(config.VISION.apriltag_woodenbox_yaw_deg)
@@ -155,20 +233,30 @@ class MissionOrchestrator:
                 center_ok = abs(float(bearing_x_deg)) <= bearing_tol
             else:
                 center_ok = abs(center_err) <= center_tol
-            yaw_ok = True if yaw_deg is None else abs(float(yaw_deg)) <= yaw_tol
+            yaw_ok = yaw_deg is not None and abs(float(yaw_deg)) <= yaw_tol
             size_ok = tag_side_px >= min_side_px
-            if not (center_ok and yaw_ok and size_ok):
-                continue
-
-            # Prefer FaceWoodenbox first, then the most front-facing tag, then nearest anchor distance.
             anchor_dist = min(
                 math.hypot(float(tag_x) - ((det.x1 + det.x2) * 0.5), float(tag_y) - ((det.y1 + det.y2) * 0.5))
                 for det in anchor_dets
             )
             anchor_priority = 0.0 if anchor_name == "FaceWoodenbox" else 1.0
-            yaw_abs = 999.0 if yaw_deg is None else abs(float(yaw_deg))
             bearing_abs = 999.0 if bearing_x_deg is None else abs(float(bearing_x_deg))
-            rank = (anchor_priority, yaw_abs, anchor_dist, bearing_abs, -tag_side_px)
+            rank = (anchor_priority, front_score, anchor_dist, bearing_abs, -tag_side_px)
+            if not (center_ok and yaw_ok and size_ok):
+                reasons: list[str] = []
+                if not center_ok:
+                    reasons.append("center")
+                if not yaw_ok:
+                    reasons.append("yaw")
+                if not size_ok:
+                    reasons.append("size")
+                reason_text = ",".join(reasons) if reasons else "unknown"
+                if best_reject is None or best_reject_rank is None or rank < best_reject_rank:
+                    best_reject = (metrics, anchor_name, reason_text)
+                    best_reject_rank = rank
+                continue
+
+            # Prefer FaceWoodenbox first, then the most front-facing tag, then nearest anchor distance.
             if best is None or best_rank is None or rank < best_rank:
                 best = (info, metrics, anchor_name)
                 best_rank = rank
@@ -178,18 +266,22 @@ class MissionOrchestrator:
                 self.status_text = "AprilTag accepted near woodenbox (FaceWoodenbox not visible yet)"
             return best[0], best[1], anno
 
-        if saw_near_face or saw_near_woodenbox:
-            sample_metrics = candidates[0][2]
+        if (saw_near_face or saw_near_woodenbox) and best_reject is not None:
+            sample_metrics, anchor_name, reason_text = best_reject
             center_err = float(sample_metrics.get("tag_center_err_norm", 0.0))
             pose_yaw_deg = sample_metrics.get("tag_pose_yaw_deg")
             practical_yaw_deg = sample_metrics.get("tag_robot_yaw_practical_deg")
+            effective_yaw_deg = sample_metrics.get("tag_effective_yaw_deg")
+            yaw_source = sample_metrics.get("tag_effective_yaw_source")
             side_px = float(sample_metrics.get("tag_side_px", 0.0))
             bearing_x_deg = sample_metrics.get("tag_bearing_x_deg")
             self.status_text = (
-                "AprilTag seen but rejected "
+                f"AprilTag seen but rejected ({anchor_name}:{reason_text}) "
                 f"(center={center_err:+.3f}, bearing={bearing_x_deg if bearing_x_deg is not None else 'na'}, "
                 f"yaw={pose_yaw_deg if pose_yaw_deg is not None else 'na'}, "
-                f"yaw2={practical_yaw_deg if practical_yaw_deg is not None else 'na'}, side_px={side_px:.1f})"
+                f"yaw2={practical_yaw_deg if practical_yaw_deg is not None else 'na'}, "
+                f"yaw_eff={effective_yaw_deg if effective_yaw_deg is not None else 'na'}, "
+                f"yaw_src={yaw_source if yaw_source is not None else 'na'}, side_px={side_px:.1f})"
             )
         else:
             self.status_text = (
@@ -207,7 +299,11 @@ class MissionOrchestrator:
         self._use_apriltag_distance_once = True
         self._plants_done_current_pair = 0
         tag_side_px = 0.0 if metrics is None else float(metrics.get("tag_side_px", 0.0))
-        if tag_side_px > 1.0 and float(config.VISION.apriltag_size_cm) > 0.0:
+        if (
+            self._manual_cm_per_px is None
+            and tag_side_px > 1.0
+            and float(config.VISION.apriltag_size_cm) > 0.0
+        ):
             self._cm_per_px = float(config.VISION.apriltag_size_cm) / tag_side_px
             self._cm_per_px_source = "apriltag(front)"
         self.status_text = (
@@ -317,6 +413,7 @@ class MissionOrchestrator:
         timeout_sec: float | None = None,
         hold_needed: int = 3,
         turn_gain: float | None = None,
+        turn_norm_min: float | None = None,
         turn_norm_max: float | None = None,
         heading_tolerance_deg: float | None = None,
         fine_band_deg: float | None = None,
@@ -329,6 +426,7 @@ class MissionOrchestrator:
         )
         hold = 0
         gain = float(turn_gain if turn_gain is not None else config.IMU.turn_gain)
+        norm_min = 0.0 if turn_norm_min is None else max(0.0, float(turn_norm_min))
         norm_max = float(turn_norm_max if turn_norm_max is not None else config.IMU.turn_norm_max)
         tolerance_deg = float(
             heading_tolerance_deg if heading_tolerance_deg is not None else config.IMU.heading_tolerance_deg
@@ -370,6 +468,10 @@ class MissionOrchestrator:
                 -active_norm,
                 active_norm,
             )
+            if norm_min > 0.0 and abs(err_deg) > tolerance_deg and abs(turn) < active_norm:
+                enforced_min = min(active_norm, norm_min)
+                if abs(turn) < enforced_min:
+                    turn = math.copysign(enforced_min, turn if abs(turn) > 1e-6 else err_deg)
             cmd = int(turn * config.VISION.max_cmd)
             self.drive.send_velocity(cmd, -cmd)
             self.status_text = f"{label}: current={current_heading:.1f} target={target_heading_deg:.1f} err={err_deg:+.1f}"
@@ -498,7 +600,7 @@ class MissionOrchestrator:
         if not bool(config.VISION.apriltag_triangle_align_enabled):
             self.status_text = "Triangle align disabled"
             return False
-        measurement = self._measure_apriltag_yaw(timeout_sec=3.0, min_samples=3)
+        measurement = self._measure_apriltag_yaw(timeout_sec=6.0, min_samples=2)
         if measurement is None:
             self.status_text = "Triangle align skipped: no usable AprilTag yaw measurement"
             return False
@@ -731,7 +833,8 @@ class MissionOrchestrator:
             timeout_sec=float(config.IMU.manual_rotate_timeout_sec),
             hold_needed=int(config.IMU.manual_rotate_hold_samples),
             turn_gain=float(config.IMU.manual_rotate_gain),
-            turn_norm_max=float(config.IMU.manual_rotate_norm_max),
+            turn_norm_min=self._get_manual_rotate_norm_min(),
+            turn_norm_max=self._get_manual_rotate_norm_max(),
             heading_tolerance_deg=float(config.IMU.manual_rotate_tolerance_deg),
         )
 
@@ -812,15 +915,91 @@ class MissionOrchestrator:
 
         with self._control_lock:
             self._manual_drive_distance_norm = float(norm)
+            self._floor_profile_name = "custom"
             self.status_text = (
                 f"Manual drive speed set to {self._manual_drive_distance_norm:.2f} "
                 f"(affects Drive By Distance + triangle move1)"
             )
         return True, self.status_text
 
+    def set_floor_profile(self, profile: str) -> tuple[bool, str]:
+        profile_name = str(profile or "").strip().lower()
+        profiles = self._build_floor_profile_values()
+        if profile_name not in profiles:
+            return False, f"unknown floor profile: {profile}"
+
+        values = profiles[profile_name]
+        with self._control_lock:
+            self._floor_profile_name = profile_name
+            self._approach_min_norm = float(values["approach_min_norm"])
+            self._approach_max_norm = float(values["approach_max_norm"])
+            self._move_to_measure_speed_norm = float(values["move_to_measure_speed_norm"])
+            self._preplant_adjust_slow_norm = float(values["preplant_adjust_slow_norm"])
+            self._manual_drive_distance_norm = float(values["manual_drive_distance_norm"])
+            self._manual_rotate_norm_min = float(values["manual_rotate_norm_min"])
+            self._manual_rotate_norm_max = float(values["manual_rotate_norm_max"])
+            self.status_text = (
+                f"Floor profile set to {profile_name} "
+                f"(approach {self._approach_min_norm:.2f}-{self._approach_max_norm:.2f}, "
+                f"measure {self._move_to_measure_speed_norm:.2f}, "
+                f"rotate {self._manual_rotate_norm_min:.2f}-{self._manual_rotate_norm_max:.2f})"
+            )
+        return True, self.status_text
+
+    def set_runtime_drive_tuning(self, values: dict) -> tuple[bool, str]:
+        def _read(name: str, lo: float = 0.05, hi: float = 1.0) -> float:
+            raw = values.get(name)
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"invalid {name}: {raw}")
+            if not lo <= val <= hi:
+                raise ValueError(f"{name} out of range: {val:.3f} (use {lo:.2f}..{hi:.2f})")
+            return float(val)
+
+        try:
+            approach_min_norm = _read("approach_min_norm")
+            approach_max_norm = _read("approach_max_norm")
+            move_to_measure_speed_norm = _read("move_to_measure_speed_norm")
+            preplant_adjust_slow_norm = _read("preplant_adjust_slow_norm")
+            manual_drive_distance_norm = _read("manual_drive_distance_norm")
+            manual_rotate_norm_min = _read("manual_rotate_norm_min")
+            manual_rotate_norm_max = _read("manual_rotate_norm_max")
+        except ValueError as exc:
+            return False, str(exc)
+
+        if approach_min_norm > approach_max_norm:
+            return False, "approach_min_norm must be <= approach_max_norm"
+        if manual_rotate_norm_min > manual_rotate_norm_max:
+            return False, "manual_rotate_norm_min must be <= manual_rotate_norm_max"
+
+        with self._control_lock:
+            self._floor_profile_name = "custom"
+            self._approach_min_norm = approach_min_norm
+            self._approach_max_norm = approach_max_norm
+            self._move_to_measure_speed_norm = move_to_measure_speed_norm
+            self._preplant_adjust_slow_norm = preplant_adjust_slow_norm
+            self._manual_drive_distance_norm = manual_drive_distance_norm
+            self._manual_rotate_norm_min = manual_rotate_norm_min
+            self._manual_rotate_norm_max = manual_rotate_norm_max
+            self.status_text = (
+                "Custom drive tuning applied "
+                f"(approach {self._approach_min_norm:.2f}-{self._approach_max_norm:.2f}, "
+                f"measure {self._move_to_measure_speed_norm:.2f}, "
+                f"rotate {self._manual_rotate_norm_min:.2f}-{self._manual_rotate_norm_max:.2f})"
+            )
+        return True, self.status_text
+
     def get_runtime_tuning(self) -> dict:
         return {
+            "floor_profile": self._floor_profile_name,
+            "approach_min_norm": float(self._approach_min_norm),
+            "approach_max_norm": float(self._approach_max_norm),
+            "move_to_measure_speed_norm": float(self._move_to_measure_speed_norm),
+            "preplant_adjust_slow_norm": float(self._preplant_adjust_slow_norm),
             "manual_drive_distance_norm": float(self._manual_drive_distance_norm),
+            "manual_rotate_norm_min": float(self._manual_rotate_norm_min),
+            "manual_rotate_norm_max": float(self._manual_rotate_norm_max),
         }
 
     def run_planting_process(self) -> tuple[bool, str]:
@@ -888,6 +1067,76 @@ class MissionOrchestrator:
         finally:
             with self._control_lock:
                 self._measuring_busy = False
+
+    def calibrate_rear_measurement(self, actual_cm: float | int | str | None) -> tuple[bool, str]:
+        """
+        Manual rear-size calibration from web using a known real object size.
+        Allowed only when auto mission is not running.
+        """
+        if self.running:
+            return False, "mission is running, stop mission before rear calibration"
+        try:
+            actual_cm_f = float(actual_cm)
+        except (TypeError, ValueError):
+            return False, f"invalid actual size cm: {actual_cm}"
+        if actual_cm_f <= 0.0:
+            return False, "actual size cm must be > 0"
+
+        with self._control_lock:
+            if self._measuring_busy:
+                return False, "measurement process already running"
+            self._measuring_busy = True
+
+        try:
+            self._stop_event.clear()
+            self.drive.stop()
+            self.state = MissionState.MEASURING_REAR_SIZE
+            self.status_text = f"Manual rear calibration running ({actual_cm_f:.2f} cm)"
+            ok = self._calibrate_rear_size_once(actual_cm_f)
+            if ok:
+                self.state = MissionState.IDLE
+                return True, "rear-size calibration completed"
+            self.state = MissionState.ERROR
+            return False, self.status_text
+        finally:
+            with self._control_lock:
+                self._measuring_busy = False
+
+    def save_rear_scale_to_env(self) -> tuple[bool, str]:
+        cm_per_px = float(self._cm_per_px)
+        if cm_per_px <= 0.0:
+            return False, "rear scale is not set"
+
+        env_path = Path(__file__).resolve().parents[2] / ".env"
+        try:
+            text = env_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = ""
+        except OSError as exc:
+            return False, f"failed to read .env: {exc}"
+
+        key = "REAR_CM_PER_PX_DEFAULT"
+        new_line = f"{key}={cm_per_px:.5f}"
+        lines = text.splitlines()
+        replaced = False
+        for idx, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[idx] = new_line
+                replaced = True
+                break
+        if not replaced:
+            lines.append(new_line)
+
+        out = "\n".join(lines)
+        if text.endswith("\n") or not lines:
+            out += "\n"
+        try:
+            env_path.write_text(out, encoding="utf-8")
+        except OSError as exc:
+            return False, f"failed to write .env: {exc}"
+
+        self.status_text = f"Saved rear scale {cm_per_px:.5f} cm/px to .env"
+        return True, self.status_text
 
     def _measure_apriltag_yaw(self, *, timeout_sec: float, min_samples: int) -> dict | None:
         deadline = time.monotonic() + max(0.5, float(timeout_sec))
@@ -1019,7 +1268,7 @@ class MissionOrchestrator:
         with self._control_lock:
             self._stop_event.clear()
             self.drive.stop()
-            measurement = self._measure_apriltag_yaw(timeout_sec=3.0, min_samples=3)
+            measurement = self._measure_apriltag_yaw(timeout_sec=8.0, min_samples=2)
             if measurement is None:
                 self.status_text = "AprilTag yaw measurement failed: no usable tag"
                 return False, self.status_text
@@ -1055,6 +1304,15 @@ class MissionOrchestrator:
         if raw is None:
             return None
         if self.detector.enabled:
+            now = time.monotonic()
+            with self._front_frame_lock:
+                interval = max(0.05, float(config.VISION.idle_preview_interval_sec))
+                if (
+                    self._front_idle_preview is not None
+                    and (now - self._front_idle_preview_ts) < interval
+                ):
+                    return self._front_idle_preview.copy()
+
             _, annotated = self.detector.detect_best(raw, config.VISION.target_classes)
             cv2.putText(
                 annotated,
@@ -1065,6 +1323,9 @@ class MissionOrchestrator:
                 (50, 220, 50),
                 2,
             )
+            with self._front_frame_lock:
+                self._front_idle_preview = annotated.copy()
+                self._front_idle_preview_ts = now
             return annotated
 
         frame = raw.copy()
@@ -1091,6 +1352,15 @@ class MissionOrchestrator:
         if raw is None:
             return None
         if self.detector.enabled:
+            now = time.monotonic()
+            with self._rear_frame_lock:
+                interval = max(0.05, float(config.VISION.idle_preview_interval_sec))
+                if (
+                    self._rear_idle_preview is not None
+                    and (now - self._rear_idle_preview_ts) < interval
+                ):
+                    return self._rear_idle_preview.copy()
+
             _, annotated = self._annotate_rear_frame(raw)
             cv2.putText(
                 annotated,
@@ -1101,6 +1371,9 @@ class MissionOrchestrator:
                 (50, 220, 50),
                 2,
             )
+            with self._rear_frame_lock:
+                self._rear_idle_preview = annotated.copy()
+                self._rear_idle_preview_ts = now
             return annotated
 
         frame = raw.copy()
@@ -1157,14 +1430,22 @@ class MissionOrchestrator:
         )
         return det, rear_anno
 
-    def _measure_rear_size_once(self, *, record_point: bool = True, phase: str = "measure") -> bool:
+    def _collect_rear_size_samples(
+        self,
+        *,
+        status_text: str,
+        overlay_prefix: str,
+        actual_cm: float | None = None,
+    ) -> tuple[str, list[float], list[float], list[float], np.ndarray | None]:
         self.drive.stop()
         self._reset_stuck_watch()
-        self.status_text = "Measuring cabbage size (rear)" if record_point else "Adjusting cabbage size (rear)"
+        self.status_text = status_text
         deadline = time.monotonic() + max(0.5, float(config.VISION.rear_measure_timeout_sec))
         need_frames = max(1, int(config.VISION.rear_measure_frames))
         target_cls = str(config.VISION.rear_measure_target_class).strip()
         sizes_px: list[float] = []
+        center_err_samples: list[float] = []
+        selected_conf_samples: list[float] = []
         last_anno = None
 
         while time.monotonic() < deadline and not self._stop_event.is_set():
@@ -1179,15 +1460,27 @@ class MissionOrchestrator:
                 max_total=max(1, int(config.VISION.rear_measure_max_total)),
                 use_priority=False,
             )
-            det = max(dets, key=self._bbox_size_px) if dets else None
+            det = self._select_rear_measure_detection(dets, rear_frame.shape) if dets else None
             if det is not None:
                 size_px = self._bbox_size_px(det)
                 sizes_px.append(size_px)
-                size_est_cm = size_px * float(self._cm_per_px)
+                center_err_norm = self._bbox_center_err_norm(det, rear_frame.shape)
+                center_err_samples.append(center_err_norm)
+                selected_conf_samples.append(float(det.conf))
+                if actual_cm is None:
+                    line = (
+                        f"{overlay_prefix} {target_cls}: {size_px * float(self._cm_per_px):.2f} cm "
+                        f"({len(dets)} det, cen={center_err_norm:+.2f})"
+                    )
+                else:
+                    line = (
+                        f"{overlay_prefix} {target_cls}: actual {actual_cm:.2f} cm "
+                        f"px={size_px:.1f} ({len(dets)} det, cen={center_err_norm:+.2f})"
+                    )
                 cv2.rectangle(rear_anno, (det.x1, det.y1), (det.x2, det.y2), (0, 128, 255), 3)
                 cv2.putText(
                     rear_anno,
-                    f"Measure {target_cls}: {size_est_cm:.2f} cm ({len(dets)} det)",
+                    line,
                     (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -1197,7 +1490,7 @@ class MissionOrchestrator:
             else:
                 cv2.putText(
                     rear_anno,
-                    f"Measure {target_cls}: no detection",
+                    f"{overlay_prefix} {target_cls}: no detection",
                     (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -1213,6 +1506,14 @@ class MissionOrchestrator:
         if last_anno is not None:
             self._set_rear_frame(last_anno)
 
+        return target_cls, sizes_px, center_err_samples, selected_conf_samples, last_anno
+
+    def _measure_rear_size_once(self, *, record_point: bool = True, phase: str = "measure") -> bool:
+        target_cls, sizes_px, center_err_samples, selected_conf_samples, _ = self._collect_rear_size_samples(
+            status_text="Measuring cabbage size (rear)" if record_point else "Adjusting cabbage size (rear)",
+            overlay_prefix="Measure",
+        )
+
         if record_point:
             self._measure_idx += 1
             idx = self._measure_idx
@@ -1220,7 +1521,8 @@ class MissionOrchestrator:
             idx = self._measure_idx
 
         if sizes_px:
-            size_px_med = float(np.median(np.array(sizes_px, dtype=np.float32)))
+            size_px_used = self._filter_rear_measure_samples(sizes_px)
+            size_px_med = float(np.median(np.array(size_px_used, dtype=np.float32)))
             size_cm = size_px_med * float(self._cm_per_px)
             threshold_cm = float(config.VISION.rear_measure_size_threshold_cm)
             reached = size_cm >= threshold_cm
@@ -1233,7 +1535,16 @@ class MissionOrchestrator:
                 "reached": bool(reached),
                 "cm_per_px": float(round(self._cm_per_px, 6)),
                 "cm_per_px_source": self._cm_per_px_source,
-                "samples": int(len(sizes_px)),
+                "samples": int(len(size_px_used)),
+                "samples_raw": int(len(sizes_px)),
+                "center_err_norm": (
+                    None if not center_err_samples
+                    else float(round(float(np.median(np.array(center_err_samples, dtype=np.float32))), 4))
+                ),
+                "selected_conf": (
+                    None if not selected_conf_samples
+                    else float(round(float(np.median(np.array(selected_conf_samples, dtype=np.float32))), 4))
+                ),
                 "phase": phase,
                 "ts": time.time(),
             }
@@ -1267,32 +1578,71 @@ class MissionOrchestrator:
             self.status_text = f"Rear adjust failed: no {target_cls} detection"
         return False
 
+    def _calibrate_rear_size_once(self, actual_cm: float) -> bool:
+        target_cls, sizes_px, center_err_samples, selected_conf_samples, _ = self._collect_rear_size_samples(
+            status_text=f"Calibrating rear size using actual {actual_cm:.2f} cm",
+            overlay_prefix="Calibrate",
+            actual_cm=float(actual_cm),
+        )
+
+        if not sizes_px:
+            self._rear_measurement = {
+                "target_class": target_cls,
+                "actual_cm": float(round(actual_cm, 3)),
+                "cm_per_px": float(round(self._cm_per_px, 6)),
+                "cm_per_px_source": self._cm_per_px_source,
+                "error": "no detection",
+                "phase": "manual_calibration",
+                "ts": time.time(),
+            }
+            self.status_text = f"Rear calibration failed: no {target_cls} detection"
+            return False
+
+        size_px_used = self._filter_rear_measure_samples(sizes_px)
+        size_px_med = float(np.median(np.array(size_px_used, dtype=np.float32)))
+        if size_px_med <= 0.0:
+            self.status_text = "Rear calibration failed: invalid size_px"
+            return False
+
+        new_cm_per_px = float(actual_cm) / size_px_med
+        self._manual_cm_per_px = new_cm_per_px
+        self._manual_cm_per_px_source = f"manual({float(actual_cm):.2f}cm)"
+        self._cm_per_px = new_cm_per_px
+        self._cm_per_px_source = self._manual_cm_per_px_source
+        self._rear_measurement = {
+            "target_class": target_cls,
+            "actual_cm": float(round(actual_cm, 3)),
+            "size_px": float(round(size_px_med, 3)),
+            "cm_per_px": float(round(new_cm_per_px, 6)),
+            "cm_per_px_source": self._cm_per_px_source,
+            "samples": int(len(size_px_used)),
+            "samples_raw": int(len(sizes_px)),
+            "center_err_norm": (
+                None if not center_err_samples
+                else float(round(float(np.median(np.array(center_err_samples, dtype=np.float32))), 4))
+            ),
+            "selected_conf": (
+                None if not selected_conf_samples
+                else float(round(float(np.median(np.array(selected_conf_samples, dtype=np.float32))), 4))
+            ),
+            "phase": "manual_calibration",
+            "ts": time.time(),
+        }
+        self.status_text = (
+            f"Rear calibration done: actual {actual_cm:.2f} cm -> "
+            f"{self._cm_per_px:.5f} cm/px ({self._cm_per_px_source})"
+        )
+        return True
+
     def _configure_preplant_rear_adjust(self, dist0_cm: float, move_increment_cm: float, first_leg: bool) -> None:
         """
-        Insert one-time rear-size adjust checkpoint after AprilTag scan:
-        trigger at FRONT_TO_PLANT_POINT_CM + PLANT_TO_CAMBACK_POINT_CM
-        before reaching the first plant target.
+        Pre-plant rear adjust is disabled; rear-size scale is calibrated manually
+        from the dashboard instead of interrupting motion during the mission.
         """
         self._preplant_adjust_pending = False
+        self._preplant_adjust_search_start_cm = float(dist0_cm)
+        self._preplant_adjust_fallback_cm = float(dist0_cm)
         self._preplant_adjust_goal_cm = float(dist0_cm)
-        if not first_leg:
-            return
-
-        front_to_plant = max(0.0, float(config.MOTION.front_to_plant_point_cm))
-        camback_offset = max(0.0, float(config.MOTION.plant_to_camback_point_cm))
-        trigger_step_cm = front_to_plant + camback_offset
-        if trigger_step_cm <= 0.0:
-            return
-        if trigger_step_cm >= float(move_increment_cm):
-            logger.warning(
-                "pre-plant rear adjust checkpoint skipped: trigger %.2f >= move %.2f",
-                trigger_step_cm,
-                float(move_increment_cm),
-            )
-            return
-
-        self._preplant_adjust_goal_cm = float(dist0_cm) + trigger_step_cm
-        self._preplant_adjust_pending = True
 
     def _update_no_box_streak(self, front_has_box: bool, rear_has_box: bool) -> bool:
         if front_has_box or rear_has_box:
@@ -1389,6 +1739,37 @@ class MissionOrchestrator:
         return (float(w) + float(h)) * 0.5
 
     @staticmethod
+    def _bbox_center_err_norm(det: Detection, frame_shape: tuple[int, int, int]) -> float:
+        w = max(1.0, float(frame_shape[1]))
+        return (float(det.cx) - (w * 0.5)) / (w * 0.5)
+
+    def _select_rear_measure_detection(
+        self,
+        dets: list[Detection],
+        frame_shape: tuple[int, int, int],
+    ) -> Detection | None:
+        if not dets:
+            return None
+        return min(
+            dets,
+            key=lambda det: (
+                abs(self._bbox_center_err_norm(det, frame_shape)),
+                -self._bbox_size_px(det),
+                -float(det.conf),
+            ),
+        )
+
+    @staticmethod
+    def _filter_rear_measure_samples(samples_px: list[float]) -> list[float]:
+        if len(samples_px) < 3:
+            return list(samples_px)
+        arr = np.array(samples_px, dtype=np.float32)
+        med = float(np.median(arr))
+        tol = max(3.0, med * 0.22)
+        filtered = [float(v) for v in arr.tolist() if abs(float(v) - med) <= tol]
+        return filtered if filtered else list(samples_px)
+
+    @staticmethod
     def _clamp(v: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, v))
 
@@ -1443,8 +1824,8 @@ class MissionOrchestrator:
         near = self._clamp((bottom - trigger * 0.6) / max(1.0, trigger * 0.4), 0.0, 1.0)
         err_abs = abs(float(lateral_err))
 
-        base_hi = float(config.VISION.approach_max_norm)
-        base_lo = float(config.VISION.approach_min_norm)
+        base_hi = self._get_approach_max_norm()
+        base_lo = self._get_approach_min_norm()
         slow_err = self._clamp(1.0 - float(config.VISION.approach_err_slow_gain) * err_abs, 0.25, 1.0)
         slow_near = self._clamp(1.0 - float(config.VISION.approach_near_slow_gain) * near, 0.25, 1.0)
         dyn = base_hi * slow_err * slow_near
@@ -1590,8 +1971,12 @@ class MissionOrchestrator:
         self._apriltag_yaw_measurement = None
         self._plant_map = []
         self._measure_idx = 0
-        self._cm_per_px = float(config.VISION.rear_cm_per_px_default)
-        self._cm_per_px_source = "default"
+        if self._manual_cm_per_px is not None:
+            self._cm_per_px = float(self._manual_cm_per_px)
+            self._cm_per_px_source = str(self._manual_cm_per_px_source or "manual")
+        else:
+            self._cm_per_px = float(config.VISION.rear_cm_per_px_default)
+            self._cm_per_px_source = "default"
         self._align_hold_count = 0
         self._reset_stuck_watch()
         self._last_track_error = 0.0
@@ -1902,11 +2287,50 @@ class MissionOrchestrator:
                     time.sleep(config.RUNTIME.vision_loop_sec)
                     continue
 
+                rear_apriltag_seen = False
+                rear_apriltag_anno = None
+                if self._preplant_adjust_pending and rear_raw is not None:
+                    rear_apriltag_info, rear_apriltag_anno, rear_apriltag_metrics = (
+                        self.apriltag.detect_and_annotate_with_metrics(
+                            rear_raw,
+                            prefer_largest_area=True,
+                        )
+                    )
+                    rear_apriltag_seen = (
+                        rear_apriltag_info is not None and rear_apriltag_metrics is not None
+                    )
+                    if rear_apriltag_seen and rear_apriltag_anno is not None:
+                        self._set_rear_frame(rear_apriltag_anno)
+
                 if self._preplant_adjust_pending and tel.distance_cm >= self._preplant_adjust_goal_cm:
+                    self._preplant_adjust_pending = False
+
+                if self._preplant_adjust_pending and rear_apriltag_seen:
                     self.drive.stop()
                     self._reset_stuck_watch()
-                    self.status_text = "Reached pre-plant checkpoint, adjusting rear cabbage size"
+                    pause_sec = max(0.0, float(config.VISION.preplant_adjust_apriltag_pause_sec))
+                    self.status_text = (
+                        f"Rear AprilTag seen, pause {pause_sec:.2f}s then adjust rear cabbage size"
+                    )
+                    if not self._sleep_interruptible(pause_sec):
+                        self._preplant_adjust_pending = False
+                        continue
                     self._measure_rear_size_once(record_point=False, phase="preplant_adjust")
+                    self._preplant_adjust_pending = False
+                    self._reset_stuck_watch()
+                    continue
+
+                if self._preplant_adjust_pending and tel.distance_cm >= self._preplant_adjust_fallback_cm:
+                    self.drive.stop()
+                    self._reset_stuck_watch()
+                    pause_sec = max(0.0, float(config.VISION.preplant_adjust_apriltag_pause_sec))
+                    self.status_text = (
+                        f"Rear AprilTag not seen, fallback pause {pause_sec:.2f}s then adjust rear cabbage size"
+                    )
+                    if not self._sleep_interruptible(pause_sec):
+                        self._preplant_adjust_pending = False
+                        continue
+                    self._measure_rear_size_once(record_point=False, phase="preplant_adjust_fallback")
                     self._preplant_adjust_pending = False
                     self._reset_stuck_watch()
                     continue
@@ -1918,7 +2342,10 @@ class MissionOrchestrator:
                     self.state = MissionState.PLANTING
                     continue
 
-                forward_cmd = int(config.VISION.max_cmd * 0.35)
+                move_norm = 0.35
+                if self._preplant_adjust_pending and tel.distance_cm >= self._preplant_adjust_search_start_cm:
+                    move_norm = self._get_preplant_adjust_slow_norm()
+                forward_cmd = int(config.VISION.max_cmd * move_norm)
                 self.drive.send_velocity(forward_cmd, forward_cmd)
                 time.sleep(config.RUNTIME.vision_loop_sec)
                 continue
@@ -1939,7 +2366,6 @@ class MissionOrchestrator:
                 # 2) second point uses AB
                 if self.april_info is not None and self._plants_done_current_pair == 0:
                     self._plants_done_current_pair = 1
-                    self._preplant_adjust_pending = False
                     ab_cm = float(self.april_info.planting_distance_cm)
                     if ab_cm > 0:
                         dist0 = self.drive.get_telemetry().distance_cm
@@ -1951,6 +2377,7 @@ class MissionOrchestrator:
 
                 if self.april_info is not None and self._plants_done_current_pair == 1:
                     self._plants_done_current_pair = 2
+                    self._preplant_adjust_pending = False
 
                 de_cm = 0.0
                 c_cm = 0.0
@@ -1998,7 +2425,7 @@ class MissionOrchestrator:
                     self.state = MissionState.MEASURING_REAR_SIZE
                     continue
 
-                forward_cmd = int(config.VISION.max_cmd * float(config.VISION.move_to_measure_speed_norm))
+                forward_cmd = int(config.VISION.max_cmd * self._get_move_to_measure_speed_norm())
                 self.drive.send_velocity(forward_cmd, forward_cmd)
                 if not self._check_stuck_and_recover(True, self._last_track_error):
                     continue
