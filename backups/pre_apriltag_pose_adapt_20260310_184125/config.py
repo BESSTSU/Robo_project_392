@@ -121,12 +121,6 @@ class VisionConfig:
     apriltag_cy: float = float(os.getenv("APRILTAG_CY", "0.0"))
     apriltag_hfov_deg: float = float(os.getenv("APRILTAG_HFOV_DEG", "0.0"))
     apriltag_vfov_deg: float = float(os.getenv("APRILTAG_VFOV_DEG", "0.0"))
-    apriltag_cam_offset_x_cm: float = float(os.getenv("APRILTAG_CAM_OFFSET_X_CM", "0.0"))
-    apriltag_cam_offset_y_cm: float = float(os.getenv("APRILTAG_CAM_OFFSET_Y_CM", "0.0"))
-    apriltag_pixel_error_y_gain: float = float(os.getenv("APRILTAG_PIXEL_ERROR_Y_GAIN", "0.25"))
-    apriltag_alpha_x: float = float(os.getenv("APRILTAG_ALPHA_X", "0.5"))
-    apriltag_alpha_y: float = float(os.getenv("APRILTAG_ALPHA_Y", "0.85"))
-    apriltag_alpha_yaw: float = float(os.getenv("APRILTAG_ALPHA_YAW", "0.7"))
 
     # AprilTag coarse align before plant-point move.
     apriltag_coarse_align_enabled: bool = _env_bool("APRILTAG_COARSE_ALIGN_ENABLED", True)
@@ -157,9 +151,6 @@ class VisionConfig:
     apriltag_woodenbox_min_side_px: float = float(os.getenv("APRILTAG_WOODENBOX_MIN_SIDE_PX", "16.0"))
     apriltag_woodenbox_bearing_deg: float = float(os.getenv("APRILTAG_WOODENBOX_BEARING_DEG", "18.0"))
     apriltag_seek_forward_norm: float = float(os.getenv("APRILTAG_SEEK_FORWARD_NORM", "0.12"))
-    manual_drive_distance_norm: float = float(os.getenv("MANUAL_DRIVE_DISTANCE_NORM", "0.24"))
-    manual_drive_distance_timeout_sec: float = float(os.getenv("MANUAL_DRIVE_DISTANCE_TIMEOUT_SEC", "12.0"))
-    manual_drive_distance_max_cm: float = float(os.getenv("MANUAL_DRIVE_DISTANCE_MAX_CM", "150.0"))
 
 
 @dataclass(frozen=True)

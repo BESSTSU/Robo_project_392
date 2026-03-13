@@ -81,7 +81,6 @@ class MissionOrchestrator:
         self._preplant_adjust_pending = False
         self._preplant_adjust_goal_cm = 0.0
         self._preapproach_tag_attempted = False
-        self._manual_drive_distance_norm = float(config.VISION.manual_drive_distance_norm)
 
     @staticmethod
     def _point_in_expanded_box(px: float, py: float, det: Detection, scale: float) -> bool:
@@ -90,9 +89,6 @@ class MissionOrchestrator:
         half_w = max(1.0, (det.x2 - det.x1) * 0.5 * scale)
         half_h = max(1.0, (det.y2 - det.y1) * 0.5 * scale)
         return (cx - half_w) <= px <= (cx + half_w) and (cy - half_h) <= py <= (cy + half_h)
-
-    def _get_manual_drive_distance_norm(self) -> float:
-        return float(self._manual_drive_distance_norm)
 
     def _try_read_apriltag_once(self, frame: np.ndarray) -> tuple[AprilTagInfo | None, dict | None, np.ndarray]:
         dets, det_anno = self.detector.detect_all(
@@ -107,7 +103,7 @@ class MissionOrchestrator:
             return None, None, anno
 
         best: tuple[AprilTagInfo, dict, str] | None = None
-        best_rank: tuple[float, float, float] | None = None
+        best_score: float | None = None
         saw_near_face = False
         saw_near_woodenbox = False
         for _, info, metrics in candidates:
@@ -136,14 +132,11 @@ class MissionOrchestrator:
                 continue
 
             center_err = float(metrics.get("tag_center_err_norm", 0.0))
-            pose_yaw_deg = metrics.get("tag_pose_yaw_deg")
-            practical_yaw_deg = metrics.get("tag_robot_yaw_practical_deg")
-            yaw_deg = practical_yaw_deg if practical_yaw_deg is not None else pose_yaw_deg
+            yaw_deg = metrics.get("tag_pose_yaw_deg")
             tag_side_px = float(metrics.get("tag_side_px", 0.0))
             bearing_x_deg = metrics.get("tag_bearing_x_deg")
             if anchor_name == "woodenbox":
                 center_tol = float(config.VISION.apriltag_woodenbox_center_tol_norm)
-                yaw_tol = float(config.VISION.apriltag_woodenbox_yaw_deg)
                 min_side_px = float(config.VISION.apriltag_woodenbox_min_side_px)
                 bearing_tol = float(config.VISION.apriltag_woodenbox_bearing_deg)
             else:
@@ -153,25 +146,25 @@ class MissionOrchestrator:
                 bearing_tol = None
             if anchor_name == "woodenbox" and bearing_x_deg is not None:
                 center_ok = abs(float(bearing_x_deg)) <= bearing_tol
+                yaw_ok = True
             else:
                 center_ok = abs(center_err) <= center_tol
-            yaw_ok = True if yaw_deg is None else abs(float(yaw_deg)) <= yaw_tol
+                yaw_ok = True if yaw_deg is None else abs(float(yaw_deg)) <= yaw_tol
             size_ok = tag_side_px >= min_side_px
             if not (center_ok and yaw_ok and size_ok):
                 continue
 
-            # Prefer FaceWoodenbox first, then the most front-facing tag, then nearest anchor distance.
-            anchor_dist = min(
+            # Prefer the tag closest to the nearest front-face anchor.
+            score = min(
                 math.hypot(float(tag_x) - ((det.x1 + det.x2) * 0.5), float(tag_y) - ((det.y1 + det.y2) * 0.5))
                 for det in anchor_dets
             )
-            anchor_priority = 0.0 if anchor_name == "FaceWoodenbox" else 1.0
-            yaw_abs = 999.0 if yaw_deg is None else abs(float(yaw_deg))
-            bearing_abs = 999.0 if bearing_x_deg is None else abs(float(bearing_x_deg))
-            rank = (anchor_priority, yaw_abs, anchor_dist, bearing_abs, -tag_side_px)
-            if best is None or best_rank is None or rank < best_rank:
+            if anchor_name == "woodenbox":
+                # Make FaceWoodenbox win over plain woodenbox whenever both are available.
+                score += 1000000.0
+            if best is None or best_score is None or score < best_score:
                 best = (info, metrics, anchor_name)
-                best_rank = rank
+                best_score = score
 
         if best is not None:
             if best[2] == "woodenbox":
@@ -181,15 +174,11 @@ class MissionOrchestrator:
         if saw_near_face or saw_near_woodenbox:
             sample_metrics = candidates[0][2]
             center_err = float(sample_metrics.get("tag_center_err_norm", 0.0))
-            pose_yaw_deg = sample_metrics.get("tag_pose_yaw_deg")
-            practical_yaw_deg = sample_metrics.get("tag_robot_yaw_practical_deg")
+            yaw_deg = sample_metrics.get("tag_pose_yaw_deg")
             side_px = float(sample_metrics.get("tag_side_px", 0.0))
-            bearing_x_deg = sample_metrics.get("tag_bearing_x_deg")
             self.status_text = (
                 "AprilTag seen but rejected "
-                f"(center={center_err:+.3f}, bearing={bearing_x_deg if bearing_x_deg is not None else 'na'}, "
-                f"yaw={pose_yaw_deg if pose_yaw_deg is not None else 'na'}, "
-                f"yaw2={practical_yaw_deg if practical_yaw_deg is not None else 'na'}, side_px={side_px:.1f})"
+                f"(center={center_err:+.3f}, yaw={yaw_deg if yaw_deg is not None else 'na'}, side_px={side_px:.1f})"
             )
         else:
             self.status_text = (
@@ -198,23 +187,6 @@ class MissionOrchestrator:
                 else "AprilTag seen but rejected (not near FaceWoodenbox/woodenbox)"
             )
         return None, None, anno
-
-    def _cache_apriltag_info(self, found: AprilTagInfo | None, metrics: dict | None) -> bool:
-        if found is None:
-            return False
-
-        self.april_info = found
-        self._use_apriltag_distance_once = True
-        self._plants_done_current_pair = 0
-        tag_side_px = 0.0 if metrics is None else float(metrics.get("tag_side_px", 0.0))
-        if tag_side_px > 1.0 and float(config.VISION.apriltag_size_cm) > 0.0:
-            self._cm_per_px = float(config.VISION.apriltag_size_cm) / tag_side_px
-            self._cm_per_px_source = "apriltag(front)"
-        self.status_text = (
-            f"Tag {found.tag_id:05d} AB={found.planting_distance_cm} Cgap={found.spacing_gap_cm} "
-            f"DE={found.cabbage_interval_cm} cm_per_px={self._cm_per_px:.4f} ({self._cm_per_px_source})"
-        )
-        return True
 
     def _run_apriltag_coarse_align(self) -> bool:
         """
@@ -301,13 +273,6 @@ class MissionOrchestrator:
     @staticmethod
     def _wrap_deg(value: float) -> float:
         return (float(value) + 180.0) % 360.0 - 180.0
-
-    @staticmethod
-    def _counts_to_signed_distance_cm(left_count: int, right_count: int) -> float:
-        wheel_circ_cm = float(config.MOTION.wheel_diameter_inch) * 2.54 * math.pi
-        cpr = max(1, int(config.MOTION.counts_per_rev))
-        avg_counts = (float(left_count) + float(right_count)) * 0.5
-        return (avg_counts / cpr) * wheel_circ_cm
 
     def _rotate_to_heading(
         self,
@@ -426,136 +391,90 @@ class MissionOrchestrator:
         self.status_text = f"{label}: move timeout"
         return False
 
-    def _drive_relative_distance(
-        self,
-        distance_cm: float,
-        hold_heading_deg: float | None,
-        label: str,
-        *,
-        timeout_sec: float | None = None,
-        drive_norm: float | None = None,
-    ) -> bool:
-        if abs(distance_cm) <= 0.0:
-            return True
-
-        start_tel = self.drive.get_telemetry()
-        start_signed_cm = self._counts_to_signed_distance_cm(start_tel.left_count, start_tel.right_count)
-        deadline = time.monotonic() + max(
-            0.5,
-            float(timeout_sec if timeout_sec is not None else config.VISION.manual_drive_distance_timeout_sec),
-        )
-        norm = abs(float(drive_norm if drive_norm is not None else self._get_manual_drive_distance_norm()))
-        base_cmd_mag = int(max(1, config.VISION.max_cmd * norm))
-        drive_dir = 1 if distance_cm >= 0.0 else -1
-        last_moved_cm = 0.0
-        last_remaining_cm = float(distance_cm)
-
-        while not self._stop_event.is_set() and time.monotonic() < deadline:
-            tel = self.drive.get_telemetry()
-            current_signed_cm = self._counts_to_signed_distance_cm(tel.left_count, tel.right_count)
-            moved_cm = current_signed_cm - start_signed_cm
-            remaining = float(distance_cm) - moved_cm
-            last_moved_cm = float(moved_cm)
-            last_remaining_cm = float(remaining)
-            if drive_dir * remaining <= 0.0:
-                self.drive.stop()
-                self.status_text = f"{label}: move done {moved_cm:.1f}cm"
-                return True
-
-            turn_cmd = 0
-            if hold_heading_deg is not None:
-                current_heading = self.drive.get_heading_deg()
-                if current_heading is not None:
-                    err_deg = self._wrap_deg(float(hold_heading_deg) - float(current_heading))
-                    turn_norm = self._clamp(
-                        err_deg * float(config.IMU.turn_gain),
-                        -float(config.IMU.turn_norm_max),
-                        float(config.IMU.turn_norm_max),
-                    )
-                    turn_cmd = int(turn_norm * config.VISION.max_cmd)
-
-            base_cmd = drive_dir * base_cmd_mag
-            left_cmd = int(
-                self._clamp((base_cmd + turn_cmd) / float(config.VISION.max_cmd), -1.0, 1.0) * config.VISION.max_cmd
-            )
-            right_cmd = int(
-                self._clamp((base_cmd - turn_cmd) / float(config.VISION.max_cmd), -1.0, 1.0) * config.VISION.max_cmd
-            )
-            self.drive.send_velocity(left_cmd, right_cmd)
-            self.status_text = f"{label}: moved={moved_cm:.1f}cm remain={remaining:.1f}cm"
-            time.sleep(config.RUNTIME.vision_loop_sec)
-
-        self.drive.stop()
-        if self._stop_event.is_set():
-            self.status_text = f"{label}: stopped moved={last_moved_cm:.1f}cm"
-        else:
-            self.status_text = (
-                f"{label}: move timeout moved={last_moved_cm:.1f}cm remain={last_remaining_cm:.1f}cm"
-            )
-        return False
-
-    def _run_apriltag_triangle_align(self) -> bool:
+    def _run_apriltag_triangle_align(self, metrics: dict | None) -> bool:
         if not bool(config.VISION.apriltag_triangle_align_enabled):
             self.status_text = "Triangle align disabled"
             return False
-        measurement = self._measure_apriltag_yaw(timeout_sec=3.0, min_samples=3)
-        if measurement is None:
-            self.status_text = "Triangle align skipped: no usable AprilTag yaw measurement"
+        if metrics is None:
+            self.status_text = "Triangle align skipped: no AprilTag metrics"
             return False
 
-        yaw_deg = measurement.get("yaw_deg")
-        approx_dist_cm = measurement.get("approx_dist_cm")
-        if yaw_deg is None or approx_dist_cm is None:
-            self.status_text = "Triangle align skipped: missing approx_dist/yaw measurement"
+        pose_x_cm = metrics.get("tag_pose_x_cm")
+        pose_z_cm = metrics.get("tag_pose_z_cm")
+        pose_yaw_deg = metrics.get("tag_pose_yaw_deg")
+        approx_dist_cm = metrics.get("tag_approx_dist_cm")
+        bearing_x_deg = metrics.get("tag_bearing_x_deg")
+        heading_now = self.drive.get_heading_deg()
+        if heading_now is None:
+            self.status_text = "Triangle align skipped: no IMU heading"
             return False
 
-        yaw_deg = float(yaw_deg)
-        approx_dist_cm = float(approx_dist_cm)
-        move1_cm = abs(approx_dist_cm * math.sin(math.radians(yaw_deg)))
-        turn1_deg = (-90.0 - yaw_deg) if yaw_deg < 0.0 else (90.0 - yaw_deg)
-        turn2_deg = 90.0 if yaw_deg < 0.0 else -90.0
+        if pose_x_cm is None or pose_z_cm is None:
+            if approx_dist_cm is None or bearing_x_deg is None:
+                self.status_text = "Triangle align skipped: insufficient tag pose"
+                return False
+            approx_dist_cm = float(approx_dist_cm)
+            bearing_rad = math.radians(float(bearing_x_deg))
+            pose_x_cm = approx_dist_cm * math.sin(bearing_rad)
+            pose_z_cm = approx_dist_cm * math.cos(bearing_rad)
+
+        x_cm = float(pose_x_cm)
+        z_cm = float(pose_z_cm)
+        if abs(x_cm) < float(config.VISION.apriltag_triangle_min_lateral_cm):
+            self.status_text = f"Triangle align skipped: lateral offset small ({x_cm:.1f}cm)"
+            return False
+
+        dist_cm = math.hypot(x_cm, z_cm)
+        if dist_cm <= 1e-6:
+            self.status_text = "Triangle align skipped: zero tag distance"
+            return False
+
+        turn1_deg = -90.0 if x_cm >= 0.0 else 90.0
+        if pose_yaw_deg is not None:
+            turn1_deg += float(pose_yaw_deg)
+        move1_cm = abs(x_cm)
+        turn2_deg = -turn1_deg
 
         if move1_cm > float(config.VISION.apriltag_triangle_max_move_cm):
             self.status_text = f"Triangle align skipped: move too large ({move1_cm:.1f}cm)"
             return False
         if abs(turn1_deg) > float(config.VISION.apriltag_triangle_max_turn_deg):
-            self.status_text = f"Triangle align skipped: turn1 too large ({turn1_deg:.1f}deg)"
-            return False
-        if abs(turn2_deg) > float(config.VISION.apriltag_triangle_max_turn_deg):
-            self.status_text = f"Triangle align skipped: turn2 too large ({turn2_deg:.1f}deg)"
+            self.status_text = f"Triangle align skipped: turn too large ({turn1_deg:.1f}deg)"
             return False
 
+        heading1 = (float(heading_now) + turn1_deg) % 360.0
         logger.info(
-            "Triangle plan(yaw-scan): approx=%.1fcm yaw=%.1fdeg turn1=%.1fdeg move1=%.1fcm turn2=%.1fdeg",
-            approx_dist_cm,
-            yaw_deg,
+            "Triangle plan(orthogonal): x=%.1fcm z=%.1fcm dist=%.1fcm turn1=%.1fdeg move1=%.1fcm turn2=%.1fdeg heading=%.1f yaw=%s",
+            x_cm,
+            z_cm,
+            dist_cm,
             turn1_deg,
             move1_cm,
             turn2_deg,
+            float(heading_now),
+            "na" if pose_yaw_deg is None else f"{float(pose_yaw_deg):.1f}",
         )
         self.status_text = (
-            f"Triangle plan: approx={approx_dist_cm:.1f} yaw={yaw_deg:.1f} "
-            f"turn1={turn1_deg:.1f} move1={move1_cm:.1f} turn2={turn2_deg:.1f}"
+            f"Triangle plan: turn1={turn1_deg:.1f} "
+            f"move1={move1_cm:.1f} turn2={turn2_deg:.1f}"
         )
-        if abs(turn1_deg) > 1.0 and not self._rotate_by_manual_degrees(turn1_deg, "triangle turn1"):
+        if abs(turn1_deg) > 1.0 and not self._rotate_to_heading(heading1, "triangle turn1"):
+            return False
+        if move1_cm > 1.0 and not self._drive_forward_distance(move1_cm, heading1, "triangle move1"):
             return False
 
-        hold_heading = self.drive.get_heading_deg()
-        if move1_cm > 1.0 and not self._drive_relative_distance(
-            move1_cm,
-            hold_heading,
-            "triangle move1",
-            timeout_sec=float(config.VISION.manual_drive_distance_timeout_sec),
-            drive_norm=self._get_manual_drive_distance_norm(),
-        ):
+        heading_after_move = self.drive.get_heading_deg()
+        if heading_after_move is None:
+            self.status_text = "triangle turn2: no IMU heading"
             return False
-
-        if abs(turn2_deg) > 1.0 and not self._rotate_by_manual_degrees(turn2_deg, "triangle turn2"):
+        target2 = (float(heading_after_move) + turn2_deg) % 360.0
+        self.status_text = f"Triangle align: turn2={turn2_deg:.1f} via IMU"
+        if abs(turn2_deg) > 1.0 and not self._rotate_to_heading(target2, "triangle turn2"):
             return False
 
         self.drive.stop()
         self.status_text = (
-            f"Triangle align done approx={approx_dist_cm:.1f}cm yaw={yaw_deg:.1f}deg "
+            f"Triangle align done x={x_cm:.1f}cm z={z_cm:.1f}cm "
             f"turn1={turn1_deg:.1f} move1={move1_cm:.1f} turn2={turn2_deg:.1f}"
         )
         return True
@@ -641,11 +560,6 @@ class MissionOrchestrator:
         if self.running:
             return False, "mission already running"
 
-        if not self.drive.link.connected and not self.drive.open():
-            return False, "drive not connected"
-        if not self.actuator.link.connected and not self.actuator.open():
-            return False, "actuator not connected"
-
         # Always start mission with physical front/rear mapping.
         self.cameras.set_swap(False)
         self.running = True
@@ -714,31 +628,10 @@ class MissionOrchestrator:
 
         return True, "ok"
 
-    def _rotate_by_manual_degrees(self, delta_deg: float, label: str) -> bool:
-        current_heading = self.drive.get_heading_deg()
-        if current_heading is None:
-            self.status_text = f"{label}: no IMU heading"
-            return False
-
-        target_heading = (float(current_heading) - float(delta_deg)) % 360.0
-        self.status_text = (
-            f"{label}: current={float(current_heading):.1f} "
-            f"delta={float(delta_deg):+.1f} target={target_heading:.1f}"
-        )
-        return self._rotate_to_heading(
-            target_heading,
-            label,
-            timeout_sec=float(config.IMU.manual_rotate_timeout_sec),
-            hold_needed=int(config.IMU.manual_rotate_hold_samples),
-            turn_gain=float(config.IMU.manual_rotate_gain),
-            turn_norm_max=float(config.IMU.manual_rotate_norm_max),
-            heading_tolerance_deg=float(config.IMU.manual_rotate_tolerance_deg),
-        )
-
     def manual_rotate(self, degrees: float) -> tuple[bool, str]:
         """
         Manual relative rotate command from web.
-        Positive degrees are inverted relative to the IMU-positive heading direction.
+        Positive degrees follow the IMU-positive heading direction.
         Allowed only when auto mission is not running.
         """
         if self.running:
@@ -755,73 +648,28 @@ class MissionOrchestrator:
         with self._control_lock:
             self._stop_event.clear()
             self.drive.stop()
-            ok = self._rotate_by_manual_degrees(delta_deg, f"manual rotate {delta_deg:+.1f}deg")
-            if ok:
-                return True, f"manual rotate done delta={delta_deg:+.1f}deg"
-            return False, self.status_text
+            current_heading = self.drive.get_heading_deg()
+            if current_heading is None:
+                self.status_text = "Manual rotate failed: no IMU heading"
+                return False, self.status_text
 
-    def manual_drive_distance(self, distance_cm: float) -> tuple[bool, str]:
-        """
-        Manual relative linear move from web in centimeters.
-        Positive values move forward, negative values move backward.
-        Allowed only when auto mission is not running.
-        """
-        if self.running:
-            return False, "mission is running, stop mission before manual distance move"
-
-        try:
-            target_cm = float(distance_cm)
-        except (TypeError, ValueError):
-            return False, f"invalid drive distance: {distance_cm}"
-
-        if abs(target_cm) < 0.1:
-            return False, "drive distance too small"
-
-        max_cm = float(config.VISION.manual_drive_distance_max_cm)
-        if abs(target_cm) > max_cm:
-            return False, f"drive distance too large: {target_cm:.1f}cm (max {max_cm:.1f}cm)"
-
-        with self._control_lock:
-            self._stop_event.clear()
-            self.drive.stop()
-            hold_heading = self.drive.get_heading_deg()
-            heading_text = "na" if hold_heading is None else f"{float(hold_heading):.1f}"
+            target_heading = (float(current_heading) + delta_deg) % 360.0
             self.status_text = (
-                f"Manual drive requested: distance={target_cm:+.1f}cm "
-                f"heading={heading_text}"
+                f"Manual rotate requested: current={float(current_heading):.1f} "
+                f"delta={delta_deg:+.1f} target={target_heading:.1f}"
             )
-            ok = self._drive_relative_distance(
-                target_cm,
-                hold_heading,
-                f"manual drive {target_cm:+.1f}cm",
-                timeout_sec=float(config.VISION.manual_drive_distance_timeout_sec),
-                drive_norm=self._get_manual_drive_distance_norm(),
+            ok = self._rotate_to_heading(
+                target_heading,
+                f"manual rotate {delta_deg:+.1f}deg",
+                timeout_sec=float(config.IMU.manual_rotate_timeout_sec),
+                hold_needed=int(config.IMU.manual_rotate_hold_samples),
+                turn_gain=float(config.IMU.manual_rotate_gain),
+                turn_norm_max=float(config.IMU.manual_rotate_norm_max),
+                heading_tolerance_deg=float(config.IMU.manual_rotate_tolerance_deg),
             )
             if ok:
-                return True, f"manual drive done target={target_cm:+.1f}cm"
+                return True, f"manual rotate done target={target_heading:.1f}"
             return False, self.status_text
-
-    def set_manual_drive_distance_norm(self, value: float) -> tuple[bool, str]:
-        try:
-            norm = float(value)
-        except (TypeError, ValueError):
-            return False, f"invalid drive speed norm: {value}"
-
-        if not 0.05 <= norm <= 1.0:
-            return False, f"drive speed norm out of range: {norm:.3f} (use 0.05..1.00)"
-
-        with self._control_lock:
-            self._manual_drive_distance_norm = float(norm)
-            self.status_text = (
-                f"Manual drive speed set to {self._manual_drive_distance_norm:.2f} "
-                f"(affects Drive By Distance + triangle move1)"
-            )
-        return True, self.status_text
-
-    def get_runtime_tuning(self) -> dict:
-        return {
-            "manual_drive_distance_norm": float(self._manual_drive_distance_norm),
-        }
 
     def run_planting_process(self) -> tuple[bool, str]:
         """
@@ -889,125 +737,6 @@ class MissionOrchestrator:
             with self._control_lock:
                 self._measuring_busy = False
 
-    def _measure_apriltag_yaw(self, *, timeout_sec: float, min_samples: int) -> dict | None:
-        deadline = time.monotonic() + max(0.5, float(timeout_sec))
-        yaw_samples: list[float] = []
-        pose_yaw_samples: list[float] = []
-        practical_yaw_samples: list[float] = []
-        bearing_samples: list[float] = []
-        dist_samples: list[float] = []
-        tag_id: int | None = None
-        last_anno: np.ndarray | None = None
-
-        while time.monotonic() < deadline and not self._stop_event.is_set():
-            frame = self.cameras.get_raw_front_frame()
-            if frame is None:
-                time.sleep(0.05)
-                continue
-
-            info, anno, metrics = self.apriltag.detect_and_annotate_with_metrics(
-                frame,
-                prefer_largest_area=True,
-            )
-            last_anno = anno
-            self._set_front_frame(anno)
-            if info is not None and metrics is not None:
-                tag_id = int(info.tag_id)
-                pose_yaw = metrics.get("tag_pose_yaw_deg")
-                practical_yaw = metrics.get("tag_robot_yaw_practical_deg")
-                yaw = practical_yaw if practical_yaw is not None else pose_yaw
-                bearing = metrics.get("tag_bearing_x_deg")
-                dist = metrics.get("tag_approx_dist_cm")
-                if pose_yaw is not None:
-                    pose_yaw_samples.append(float(pose_yaw))
-                if practical_yaw is not None:
-                    practical_yaw_samples.append(float(practical_yaw))
-                if yaw is not None:
-                    yaw_samples.append(float(yaw))
-                if bearing is not None:
-                    bearing_samples.append(float(bearing))
-                if dist is not None:
-                    dist_samples.append(float(dist))
-                if len(yaw_samples) >= max(1, int(min_samples)):
-                    break
-            time.sleep(config.RUNTIME.vision_loop_sec)
-
-        if last_anno is not None:
-            self._set_front_frame(last_anno)
-
-        if not yaw_samples:
-            self._apriltag_yaw_measurement = {
-                "error": "no apriltag yaw measurement",
-                "ts": time.time(),
-            }
-            return None
-
-        yaw_deg = float(np.median(np.array(yaw_samples, dtype=np.float32)))
-        pose_yaw_deg = (
-            float(np.median(np.array(pose_yaw_samples, dtype=np.float32)))
-            if pose_yaw_samples else None
-        )
-        practical_yaw_deg = (
-            float(np.median(np.array(practical_yaw_samples, dtype=np.float32)))
-            if practical_yaw_samples else None
-        )
-        bearing_deg = (
-            float(np.median(np.array(bearing_samples, dtype=np.float32)))
-            if bearing_samples else None
-        )
-        dist_cm = (
-            float(np.median(np.array(dist_samples, dtype=np.float32)))
-            if dist_samples else None
-        )
-        robot_forward_samples = []
-        robot_lateral_samples = []
-        latest_practical_yaw_deg = None
-        frame = self.cameras.get_raw_front_frame()
-        if frame is not None:
-            _, _, m2 = self.apriltag.detect_and_annotate_with_metrics(
-                frame,
-                prefer_largest_area=True,
-            )
-            if m2 is not None:
-                if m2.get("tag_robot_forward_cm") is not None:
-                    robot_forward_samples.append(float(m2["tag_robot_forward_cm"]))
-                if m2.get("tag_robot_lateral_cm") is not None:
-                    robot_lateral_samples.append(float(m2["tag_robot_lateral_cm"]))
-                if m2.get("tag_robot_yaw_practical_deg") is not None:
-                    latest_practical_yaw_deg = float(m2["tag_robot_yaw_practical_deg"])
-        self._apriltag_yaw_measurement = {
-            "tag_id": tag_id,
-            "yaw_deg": float(round(yaw_deg, 3)),
-            "yaw_source": (
-                "practical"
-                if practical_yaw_deg is not None
-                else "pose"
-            ),
-            "selection_mode": "largest_area",
-            "yaw_pose_deg": (
-                None if pose_yaw_deg is None else float(round(pose_yaw_deg, 3))
-            ),
-            "yaw_practical_deg": (
-                None if practical_yaw_deg is None else float(round(practical_yaw_deg, 3))
-            ),
-            "bearing_x_deg": None if bearing_deg is None else float(round(bearing_deg, 3)),
-            "approx_dist_cm": None if dist_cm is None else float(round(dist_cm, 3)),
-            "robot_forward_cm": (
-                None if not robot_forward_samples
-                else float(round(float(np.median(np.array(robot_forward_samples, dtype=np.float32))), 3))
-            ),
-            "robot_lateral_cm": (
-                None if not robot_lateral_samples
-                else float(round(float(np.median(np.array(robot_lateral_samples, dtype=np.float32))), 3))
-            ),
-            "latest_yaw_practical_deg": (
-                None if latest_practical_yaw_deg is None else float(round(latest_practical_yaw_deg, 3))
-            ),
-            "samples": int(len(yaw_samples)),
-            "ts": time.time(),
-        }
-        return self._apriltag_yaw_measurement
-
     def run_apriltag_yaw_measurement(self) -> tuple[bool, str]:
         """
         Trigger one front-camera AprilTag yaw measurement from web.
@@ -1019,19 +748,71 @@ class MissionOrchestrator:
         with self._control_lock:
             self._stop_event.clear()
             self.drive.stop()
-            measurement = self._measure_apriltag_yaw(timeout_sec=3.0, min_samples=3)
-            if measurement is None:
-                self.status_text = "AprilTag yaw measurement failed: no usable tag"
-                return False, self.status_text
+            deadline = time.monotonic() + 3.0
+            yaw_samples: list[float] = []
+            bearing_samples: list[float] = []
+            dist_samples: list[float] = []
+            tag_id: int | None = None
+            last_anno: np.ndarray | None = None
 
-            yaw_deg = float(measurement["yaw_deg"])
-            bearing_deg = measurement.get("bearing_x_deg")
-            self.status_text = (
-                f"AprilTag yaw measured: yaw={yaw_deg:.1f}deg bearing={float(bearing_deg):.1f}deg"
-                if bearing_deg is not None
-                else f"AprilTag yaw measured: yaw={yaw_deg:.1f}deg"
-            )
-            return True, self.status_text
+            while time.monotonic() < deadline and not self._stop_event.is_set():
+                frame = self.cameras.get_raw_front_frame()
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+
+                info, anno, metrics = self.apriltag.detect_and_annotate_with_metrics(frame)
+                last_anno = anno
+                self._set_front_frame(anno)
+                if info is not None and metrics is not None:
+                    tag_id = int(info.tag_id)
+                    yaw = metrics.get("tag_pose_yaw_deg")
+                    bearing = metrics.get("tag_bearing_x_deg")
+                    dist = metrics.get("tag_approx_dist_cm")
+                    if yaw is not None:
+                        yaw_samples.append(float(yaw))
+                    if bearing is not None:
+                        bearing_samples.append(float(bearing))
+                    if dist is not None:
+                        dist_samples.append(float(dist))
+                    if len(yaw_samples) >= 3:
+                        break
+                time.sleep(config.RUNTIME.vision_loop_sec)
+
+            if last_anno is not None:
+                self._set_front_frame(last_anno)
+
+            if yaw_samples:
+                yaw_deg = float(np.median(np.array(yaw_samples, dtype=np.float32)))
+                bearing_deg = (
+                    float(np.median(np.array(bearing_samples, dtype=np.float32)))
+                    if bearing_samples else None
+                )
+                dist_cm = (
+                    float(np.median(np.array(dist_samples, dtype=np.float32)))
+                    if dist_samples else None
+                )
+                self._apriltag_yaw_measurement = {
+                    "tag_id": tag_id,
+                    "yaw_deg": float(round(yaw_deg, 3)),
+                    "bearing_x_deg": None if bearing_deg is None else float(round(bearing_deg, 3)),
+                    "approx_dist_cm": None if dist_cm is None else float(round(dist_cm, 3)),
+                    "samples": int(len(yaw_samples)),
+                    "ts": time.time(),
+                }
+                self.status_text = (
+                    f"AprilTag yaw measured: yaw={yaw_deg:.1f}deg "
+                    f"bearing={bearing_deg:.1f}deg" if bearing_deg is not None
+                    else f"AprilTag yaw measured: yaw={yaw_deg:.1f}deg"
+                )
+                return True, self.status_text
+
+            self._apriltag_yaw_measurement = {
+                "error": "no apriltag yaw measurement",
+                "ts": time.time(),
+            }
+            self.status_text = "AprilTag yaw measurement failed: no usable tag"
+            return False, self.status_text
 
     def toggle_camera_swap(self) -> tuple[bool, str]:
         if self.running:
@@ -1600,16 +1381,7 @@ class MissionOrchestrator:
         self._preapproach_tag_attempted = False
 
         self.state = MissionState.READING_APRILTAG
-        self.status_text = "Start mission, startup triangle scan"
-        startup_triangle_ok = self._run_apriltag_triangle_align()
-        startup_triangle_status = self.status_text
-        if startup_triangle_ok:
-            logger.info("Startup triangle align completed before search")
-            self.status_text = "Startup triangle complete, searching target"
-        else:
-            logger.warning("Startup triangle align failed/skipped: %s", startup_triangle_status)
-            self.status_text = f"Startup triangle skipped, searching target ({startup_triangle_status})"
-        self.state = MissionState.SEARCHING_TARGET
+        self.status_text = "Start mission, scanning AprilTag first"
         search_start = time.monotonic()
 
         while not self._stop_event.is_set():
@@ -1836,10 +1608,24 @@ class MissionOrchestrator:
                 continue
 
             if self.state == MissionState.READING_APRILTAG:
+                tag_metrics = None
+                triangle_or_coarse_ok = False
                 if self.april_info is None:
                     found, metrics, tag_anno = self._try_read_apriltag_once(front_raw)
                     self._set_front_frame(tag_anno)
-                    self._cache_apriltag_info(found, metrics)
+                    if found is not None:
+                        self.april_info = found
+                        tag_metrics = metrics
+                        self._use_apriltag_distance_once = True
+                        self._plants_done_current_pair = 0
+                        tag_side_px = 0.0 if metrics is None else float(metrics.get("tag_side_px", 0.0))
+                        if tag_side_px > 1.0 and float(config.VISION.apriltag_size_cm) > 0.0:
+                            self._cm_per_px = float(config.VISION.apriltag_size_cm) / tag_side_px
+                            self._cm_per_px_source = "apriltag(front)"
+                        self.status_text = (
+                            f"Tag {found.tag_id:05d} AB={found.planting_distance_cm} Cgap={found.spacing_gap_cm} "
+                            f"DE={found.cabbage_interval_cm} cm_per_px={self._cm_per_px:.4f} ({self._cm_per_px_source})"
+                        )
                     if self.april_info is None:
                         det_front, front_anno = self.detector.detect_best(front_raw, config.VISION.target_classes)
                         det_rear, rear_anno = self._annotate_rear_frame(rear_raw)
@@ -1868,11 +1654,23 @@ class MissionOrchestrator:
                         self.status_text = "Scanning AprilTag: no front woodenbox, searching target"
                         continue
 
+                if self.april_info is not None:
+                    triangle_or_coarse_ok = self._run_apriltag_triangle_align(tag_metrics)
+                    if triangle_or_coarse_ok and tag_metrics is not None:
+                        logger.info("AprilTag triangle align completed before PID entry")
+                    else:
+                        logger.warning("Triangle align failed/skipped: %s", self.status_text)
+
                 self.drive.stop()
                 self._align_hold_count = 0
                 self._reset_stuck_watch()
-                self.state = MissionState.APPROACHING_TARGET
-                self.status_text = "AprilTag read, continue PID approach"
+                if triangle_or_coarse_ok:
+                    self.state = MissionState.ALIGNING_ENTRY
+                    self.status_text = "Triangle complete, begin entry align"
+                else:
+                    fail_reason = self.status_text
+                    self.state = MissionState.APPROACHING_TARGET
+                    self.status_text = f"Triangle failed, continue PID approach ({fail_reason})"
                 continue
 
             if self.state == MissionState.MOVING_TO_PLANT_POINT:
@@ -1936,43 +1734,40 @@ class MissionOrchestrator:
 
                 # Plant only 2 points per cycle:
                 # 1) first point uses AB+offset
-                # 2) second point uses AB
+                # 2) second point uses C spacing
                 if self.april_info is not None and self._plants_done_current_pair == 0:
                     self._plants_done_current_pair = 1
                     self._preplant_adjust_pending = False
-                    ab_cm = float(self.april_info.planting_distance_cm)
-                    if ab_cm > 0:
+                    c_cm = float(self.april_info.spacing_gap_cm)
+                    if c_cm > 0:
                         dist0 = self.drive.get_telemetry().distance_cm
-                        self._distance_goal_cm = dist0 + ab_cm
+                        self._distance_goal_cm = dist0 + c_cm
                         self.state = MissionState.MOVING_TO_PLANT_POINT
-                        self.status_text = f"Plant #1 done, move to #2 by AB={ab_cm:.1f} cm"
+                        self.status_text = f"Plant #1 done, move to #2 by C={c_cm:.1f} cm"
                         continue
-                    logger.warning("AB distance from AprilTag is <=0, skip 2nd planting move")
+                    logger.warning("C spacing from AprilTag is <=0, skip 2nd planting move")
 
                 if self.april_info is not None and self._plants_done_current_pair == 1:
                     self._plants_done_current_pair = 2
 
                 de_cm = 0.0
-                c_cm = 0.0
                 if self.april_info is not None:
-                    c_cm = float(self.april_info.spacing_gap_cm)
                     de_cm = float(self.april_info.cabbage_interval_cm)
                 self._measure_interval_cm = max(0.0, de_cm)
                 first_measure_offset_cm = max(0.0, float(config.MOTION.plant_to_camback_point_cm))
-                first_measure_base_cm = max(0.0, c_cm)
-                first_measure_step_cm = first_measure_base_cm + first_measure_offset_cm
+                first_measure_step_cm = self._measure_interval_cm + first_measure_offset_cm
                 self.state = MissionState.MOVING_TO_MEASURE_POINT
-                if first_measure_step_cm > 0:
+                if self._measure_interval_cm > 0:
                     dist0 = self.drive.get_telemetry().distance_cm
                     self._distance_goal_cm = dist0 + first_measure_step_cm
                     self.status_text = (
                         "Move to first rear-measure point by "
-                        f"C+CamBack={first_measure_step_cm:.1f} cm "
-                        f"(C={first_measure_base_cm:.1f} + offset={first_measure_offset_cm:.1f})"
+                        f"DE+CamBack={first_measure_step_cm:.1f} cm "
+                        f"(DE={self._measure_interval_cm:.1f} + offset={first_measure_offset_cm:.1f})"
                     )
                 else:
                     self._distance_goal_cm = self.drive.get_telemetry().distance_cm
-                    self.status_text = "C invalid, measure at current position"
+                    self.status_text = "DE invalid, measure at current position"
                 continue
 
             if self.state == MissionState.MOVING_TO_MEASURE_POINT:

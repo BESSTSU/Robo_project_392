@@ -27,28 +27,48 @@ class SerialLink:
         self._listeners: list[Callable[[str], None]] = []
         self._recent_lines = deque(maxlen=200)
         self.connected = False
+        self._last_open_error = ""
 
-    def open(self) -> bool:
+    def _open_serial(self) -> bool:
         try:
             self._ser = serial.Serial(self.port, self.baud, timeout=0.05)
             self.connected = True
-            self._running = True
-            self._thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self._thread.start()
-            logger.info("[%s] connected at %s @ %d", self.name, self.port, self.baud)
+            self._last_open_error = ""
             return True
         except Exception as exc:
-            logger.warning("[%s] open failed (%s): %s", self.name, self.port, exc)
+            self._ser = None
             self.connected = False
+            self._last_open_error = str(exc)
             return False
+
+    def open(self) -> bool:
+        ok = self._open_serial()
+        if not ok:
+            logger.warning("[%s] open failed (%s): %s", self.name, self.port, self._last_open_error)
+            return False
+
+        self._running = True
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+        logger.info("[%s] connected at %s @ %d", self.name, self.port, self.baud)
+        return True
 
     def add_listener(self, listener: Callable[[str], None]) -> None:
         self._listeners.append(listener)
+
+    def ensure_open(self) -> bool:
+        if self.connected and self._ser is not None:
+            return True
+        ok = self._open_serial()
+        if ok:
+            logger.info("[%s] reconnected at %s @ %d", self.name, self.port, self.baud)
+        return ok
 
     def _reader_loop(self) -> None:
         while self._running:
             try:
                 if self._ser is None:
+                    self.ensure_open()
                     time.sleep(0.2)
                     continue
 
@@ -65,11 +85,18 @@ class SerialLink:
             except Exception as exc:
                 logger.warning("[%s] read error: %s", self.name, exc)
                 self.connected = False
+                try:
+                    if self._ser is not None:
+                        self._ser.close()
+                except Exception:
+                    pass
+                self._ser = None
                 time.sleep(0.2)
 
     def send_line(self, line: str) -> tuple[bool, str]:
         if self._ser is None or not self.connected:
-            return False, "not connected"
+            if not self.ensure_open():
+                return False, f"not connected ({self._last_open_error or 'open failed'})"
 
         try:
             with self._lock:
@@ -81,6 +108,15 @@ class SerialLink:
 
     def recent_lines(self) -> list[str]:
         return list(self._recent_lines)
+
+    def reset_input_buffer(self) -> None:
+        if self._ser is None:
+            return
+        try:
+            with self._lock:
+                self._ser.reset_input_buffer()
+        except Exception as exc:
+            logger.debug("[%s] reset_input_buffer failed: %s", self.name, exc)
 
     def close(self) -> None:
         self._running = False

@@ -75,6 +75,7 @@ class MissionSnapshot:
     imu: Optional[dict] = None
     pid: Optional[dict] = None
     rear_measurement: Optional[dict] = None
+    apriltag_yaw_measurement: Optional[dict] = None
     plant_map: Optional[list[dict]] = None
 
     def to_dict(self) -> dict:

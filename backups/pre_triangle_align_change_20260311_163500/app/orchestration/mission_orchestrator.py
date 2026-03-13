@@ -81,7 +81,6 @@ class MissionOrchestrator:
         self._preplant_adjust_pending = False
         self._preplant_adjust_goal_cm = 0.0
         self._preapproach_tag_attempted = False
-        self._manual_drive_distance_norm = float(config.VISION.manual_drive_distance_norm)
 
     @staticmethod
     def _point_in_expanded_box(px: float, py: float, det: Detection, scale: float) -> bool:
@@ -90,9 +89,6 @@ class MissionOrchestrator:
         half_w = max(1.0, (det.x2 - det.x1) * 0.5 * scale)
         half_h = max(1.0, (det.y2 - det.y1) * 0.5 * scale)
         return (cx - half_w) <= px <= (cx + half_w) and (cy - half_h) <= py <= (cy + half_h)
-
-    def _get_manual_drive_distance_norm(self) -> float:
-        return float(self._manual_drive_distance_norm)
 
     def _try_read_apriltag_once(self, frame: np.ndarray) -> tuple[AprilTagInfo | None, dict | None, np.ndarray]:
         dets, det_anno = self.detector.detect_all(
@@ -107,7 +103,7 @@ class MissionOrchestrator:
             return None, None, anno
 
         best: tuple[AprilTagInfo, dict, str] | None = None
-        best_rank: tuple[float, float, float] | None = None
+        best_score: float | None = None
         saw_near_face = False
         saw_near_woodenbox = False
         for _, info, metrics in candidates:
@@ -136,14 +132,11 @@ class MissionOrchestrator:
                 continue
 
             center_err = float(metrics.get("tag_center_err_norm", 0.0))
-            pose_yaw_deg = metrics.get("tag_pose_yaw_deg")
-            practical_yaw_deg = metrics.get("tag_robot_yaw_practical_deg")
-            yaw_deg = practical_yaw_deg if practical_yaw_deg is not None else pose_yaw_deg
+            yaw_deg = metrics.get("tag_pose_yaw_deg")
             tag_side_px = float(metrics.get("tag_side_px", 0.0))
             bearing_x_deg = metrics.get("tag_bearing_x_deg")
             if anchor_name == "woodenbox":
                 center_tol = float(config.VISION.apriltag_woodenbox_center_tol_norm)
-                yaw_tol = float(config.VISION.apriltag_woodenbox_yaw_deg)
                 min_side_px = float(config.VISION.apriltag_woodenbox_min_side_px)
                 bearing_tol = float(config.VISION.apriltag_woodenbox_bearing_deg)
             else:
@@ -153,25 +146,25 @@ class MissionOrchestrator:
                 bearing_tol = None
             if anchor_name == "woodenbox" and bearing_x_deg is not None:
                 center_ok = abs(float(bearing_x_deg)) <= bearing_tol
+                yaw_ok = True
             else:
                 center_ok = abs(center_err) <= center_tol
-            yaw_ok = True if yaw_deg is None else abs(float(yaw_deg)) <= yaw_tol
+                yaw_ok = True if yaw_deg is None else abs(float(yaw_deg)) <= yaw_tol
             size_ok = tag_side_px >= min_side_px
             if not (center_ok and yaw_ok and size_ok):
                 continue
 
-            # Prefer FaceWoodenbox first, then the most front-facing tag, then nearest anchor distance.
-            anchor_dist = min(
+            # Prefer the tag closest to the nearest front-face anchor.
+            score = min(
                 math.hypot(float(tag_x) - ((det.x1 + det.x2) * 0.5), float(tag_y) - ((det.y1 + det.y2) * 0.5))
                 for det in anchor_dets
             )
-            anchor_priority = 0.0 if anchor_name == "FaceWoodenbox" else 1.0
-            yaw_abs = 999.0 if yaw_deg is None else abs(float(yaw_deg))
-            bearing_abs = 999.0 if bearing_x_deg is None else abs(float(bearing_x_deg))
-            rank = (anchor_priority, yaw_abs, anchor_dist, bearing_abs, -tag_side_px)
-            if best is None or best_rank is None or rank < best_rank:
+            if anchor_name == "woodenbox":
+                # Make FaceWoodenbox win over plain woodenbox whenever both are available.
+                score += 1000000.0
+            if best is None or best_score is None or score < best_score:
                 best = (info, metrics, anchor_name)
-                best_rank = rank
+                best_score = score
 
         if best is not None:
             if best[2] == "woodenbox":
@@ -181,15 +174,11 @@ class MissionOrchestrator:
         if saw_near_face or saw_near_woodenbox:
             sample_metrics = candidates[0][2]
             center_err = float(sample_metrics.get("tag_center_err_norm", 0.0))
-            pose_yaw_deg = sample_metrics.get("tag_pose_yaw_deg")
-            practical_yaw_deg = sample_metrics.get("tag_robot_yaw_practical_deg")
+            yaw_deg = sample_metrics.get("tag_pose_yaw_deg")
             side_px = float(sample_metrics.get("tag_side_px", 0.0))
-            bearing_x_deg = sample_metrics.get("tag_bearing_x_deg")
             self.status_text = (
                 "AprilTag seen but rejected "
-                f"(center={center_err:+.3f}, bearing={bearing_x_deg if bearing_x_deg is not None else 'na'}, "
-                f"yaw={pose_yaw_deg if pose_yaw_deg is not None else 'na'}, "
-                f"yaw2={practical_yaw_deg if practical_yaw_deg is not None else 'na'}, side_px={side_px:.1f})"
+                f"(center={center_err:+.3f}, yaw={yaw_deg if yaw_deg is not None else 'na'}, side_px={side_px:.1f})"
             )
         else:
             self.status_text = (
@@ -198,23 +187,6 @@ class MissionOrchestrator:
                 else "AprilTag seen but rejected (not near FaceWoodenbox/woodenbox)"
             )
         return None, None, anno
-
-    def _cache_apriltag_info(self, found: AprilTagInfo | None, metrics: dict | None) -> bool:
-        if found is None:
-            return False
-
-        self.april_info = found
-        self._use_apriltag_distance_once = True
-        self._plants_done_current_pair = 0
-        tag_side_px = 0.0 if metrics is None else float(metrics.get("tag_side_px", 0.0))
-        if tag_side_px > 1.0 and float(config.VISION.apriltag_size_cm) > 0.0:
-            self._cm_per_px = float(config.VISION.apriltag_size_cm) / tag_side_px
-            self._cm_per_px_source = "apriltag(front)"
-        self.status_text = (
-            f"Tag {found.tag_id:05d} AB={found.planting_distance_cm} Cgap={found.spacing_gap_cm} "
-            f"DE={found.cabbage_interval_cm} cm_per_px={self._cm_per_px:.4f} ({self._cm_per_px_source})"
-        )
-        return True
 
     def _run_apriltag_coarse_align(self) -> bool:
         """
@@ -444,7 +416,7 @@ class MissionOrchestrator:
             0.5,
             float(timeout_sec if timeout_sec is not None else config.VISION.manual_drive_distance_timeout_sec),
         )
-        norm = abs(float(drive_norm if drive_norm is not None else self._get_manual_drive_distance_norm()))
+        norm = abs(float(drive_norm if drive_norm is not None else config.VISION.manual_drive_distance_norm))
         base_cmd_mag = int(max(1, config.VISION.max_cmd * norm))
         drive_dir = 1 if distance_cm >= 0.0 else -1
         last_moved_cm = 0.0
@@ -546,7 +518,7 @@ class MissionOrchestrator:
             hold_heading,
             "triangle move1",
             timeout_sec=float(config.VISION.manual_drive_distance_timeout_sec),
-            drive_norm=self._get_manual_drive_distance_norm(),
+            drive_norm=float(config.VISION.manual_drive_distance_norm),
         ):
             return False
 
@@ -795,33 +767,11 @@ class MissionOrchestrator:
                 hold_heading,
                 f"manual drive {target_cm:+.1f}cm",
                 timeout_sec=float(config.VISION.manual_drive_distance_timeout_sec),
-                drive_norm=self._get_manual_drive_distance_norm(),
+                drive_norm=float(config.VISION.manual_drive_distance_norm),
             )
             if ok:
                 return True, f"manual drive done target={target_cm:+.1f}cm"
             return False, self.status_text
-
-    def set_manual_drive_distance_norm(self, value: float) -> tuple[bool, str]:
-        try:
-            norm = float(value)
-        except (TypeError, ValueError):
-            return False, f"invalid drive speed norm: {value}"
-
-        if not 0.05 <= norm <= 1.0:
-            return False, f"drive speed norm out of range: {norm:.3f} (use 0.05..1.00)"
-
-        with self._control_lock:
-            self._manual_drive_distance_norm = float(norm)
-            self.status_text = (
-                f"Manual drive speed set to {self._manual_drive_distance_norm:.2f} "
-                f"(affects Drive By Distance + triangle move1)"
-            )
-        return True, self.status_text
-
-    def get_runtime_tuning(self) -> dict:
-        return {
-            "manual_drive_distance_norm": float(self._manual_drive_distance_norm),
-        }
 
     def run_planting_process(self) -> tuple[bool, str]:
         """
@@ -892,8 +842,6 @@ class MissionOrchestrator:
     def _measure_apriltag_yaw(self, *, timeout_sec: float, min_samples: int) -> dict | None:
         deadline = time.monotonic() + max(0.5, float(timeout_sec))
         yaw_samples: list[float] = []
-        pose_yaw_samples: list[float] = []
-        practical_yaw_samples: list[float] = []
         bearing_samples: list[float] = []
         dist_samples: list[float] = []
         tag_id: int | None = None
@@ -905,23 +853,14 @@ class MissionOrchestrator:
                 time.sleep(0.05)
                 continue
 
-            info, anno, metrics = self.apriltag.detect_and_annotate_with_metrics(
-                frame,
-                prefer_largest_area=True,
-            )
+            info, anno, metrics = self.apriltag.detect_and_annotate_with_metrics(frame)
             last_anno = anno
             self._set_front_frame(anno)
             if info is not None and metrics is not None:
                 tag_id = int(info.tag_id)
-                pose_yaw = metrics.get("tag_pose_yaw_deg")
-                practical_yaw = metrics.get("tag_robot_yaw_practical_deg")
-                yaw = practical_yaw if practical_yaw is not None else pose_yaw
+                yaw = metrics.get("tag_pose_yaw_deg")
                 bearing = metrics.get("tag_bearing_x_deg")
                 dist = metrics.get("tag_approx_dist_cm")
-                if pose_yaw is not None:
-                    pose_yaw_samples.append(float(pose_yaw))
-                if practical_yaw is not None:
-                    practical_yaw_samples.append(float(practical_yaw))
                 if yaw is not None:
                     yaw_samples.append(float(yaw))
                 if bearing is not None:
@@ -943,14 +882,6 @@ class MissionOrchestrator:
             return None
 
         yaw_deg = float(np.median(np.array(yaw_samples, dtype=np.float32)))
-        pose_yaw_deg = (
-            float(np.median(np.array(pose_yaw_samples, dtype=np.float32)))
-            if pose_yaw_samples else None
-        )
-        practical_yaw_deg = (
-            float(np.median(np.array(practical_yaw_samples, dtype=np.float32)))
-            if practical_yaw_samples else None
-        )
         bearing_deg = (
             float(np.median(np.array(bearing_samples, dtype=np.float32)))
             if bearing_samples else None
@@ -961,34 +892,23 @@ class MissionOrchestrator:
         )
         robot_forward_samples = []
         robot_lateral_samples = []
-        latest_practical_yaw_deg = None
+        practical_yaw_samples = []
         frame = self.cameras.get_raw_front_frame()
         if frame is not None:
-            _, _, m2 = self.apriltag.detect_and_annotate_with_metrics(
-                frame,
-                prefer_largest_area=True,
-            )
+            _, _, m2 = self.apriltag.detect_and_annotate_with_metrics(frame)
             if m2 is not None:
                 if m2.get("tag_robot_forward_cm") is not None:
                     robot_forward_samples.append(float(m2["tag_robot_forward_cm"]))
                 if m2.get("tag_robot_lateral_cm") is not None:
                     robot_lateral_samples.append(float(m2["tag_robot_lateral_cm"]))
                 if m2.get("tag_robot_yaw_practical_deg") is not None:
-                    latest_practical_yaw_deg = float(m2["tag_robot_yaw_practical_deg"])
+                    practical_yaw_samples.append(float(m2["tag_robot_yaw_practical_deg"]))
         self._apriltag_yaw_measurement = {
             "tag_id": tag_id,
             "yaw_deg": float(round(yaw_deg, 3)),
-            "yaw_source": (
-                "practical"
-                if practical_yaw_deg is not None
-                else "pose"
-            ),
-            "selection_mode": "largest_area",
-            "yaw_pose_deg": (
-                None if pose_yaw_deg is None else float(round(pose_yaw_deg, 3))
-            ),
             "yaw_practical_deg": (
-                None if practical_yaw_deg is None else float(round(practical_yaw_deg, 3))
+                None if not practical_yaw_samples
+                else float(round(float(np.median(np.array(practical_yaw_samples, dtype=np.float32))), 3))
             ),
             "bearing_x_deg": None if bearing_deg is None else float(round(bearing_deg, 3)),
             "approx_dist_cm": None if dist_cm is None else float(round(dist_cm, 3)),
@@ -999,9 +919,6 @@ class MissionOrchestrator:
             "robot_lateral_cm": (
                 None if not robot_lateral_samples
                 else float(round(float(np.median(np.array(robot_lateral_samples, dtype=np.float32))), 3))
-            ),
-            "latest_yaw_practical_deg": (
-                None if latest_practical_yaw_deg is None else float(round(latest_practical_yaw_deg, 3))
             ),
             "samples": int(len(yaw_samples)),
             "ts": time.time(),
@@ -1839,7 +1756,18 @@ class MissionOrchestrator:
                 if self.april_info is None:
                     found, metrics, tag_anno = self._try_read_apriltag_once(front_raw)
                     self._set_front_frame(tag_anno)
-                    self._cache_apriltag_info(found, metrics)
+                    if found is not None:
+                        self.april_info = found
+                        self._use_apriltag_distance_once = True
+                        self._plants_done_current_pair = 0
+                        tag_side_px = 0.0 if metrics is None else float(metrics.get("tag_side_px", 0.0))
+                        if tag_side_px > 1.0 and float(config.VISION.apriltag_size_cm) > 0.0:
+                            self._cm_per_px = float(config.VISION.apriltag_size_cm) / tag_side_px
+                            self._cm_per_px_source = "apriltag(front)"
+                        self.status_text = (
+                            f"Tag {found.tag_id:05d} AB={found.planting_distance_cm} Cgap={found.spacing_gap_cm} "
+                            f"DE={found.cabbage_interval_cm} cm_per_px={self._cm_per_px:.4f} ({self._cm_per_px_source})"
+                        )
                     if self.april_info is None:
                         det_front, front_anno = self.detector.detect_best(front_raw, config.VISION.target_classes)
                         det_rear, rear_anno = self._annotate_rear_frame(rear_raw)
@@ -1936,43 +1864,40 @@ class MissionOrchestrator:
 
                 # Plant only 2 points per cycle:
                 # 1) first point uses AB+offset
-                # 2) second point uses AB
+                # 2) second point uses C spacing
                 if self.april_info is not None and self._plants_done_current_pair == 0:
                     self._plants_done_current_pair = 1
                     self._preplant_adjust_pending = False
-                    ab_cm = float(self.april_info.planting_distance_cm)
-                    if ab_cm > 0:
+                    c_cm = float(self.april_info.spacing_gap_cm)
+                    if c_cm > 0:
                         dist0 = self.drive.get_telemetry().distance_cm
-                        self._distance_goal_cm = dist0 + ab_cm
+                        self._distance_goal_cm = dist0 + c_cm
                         self.state = MissionState.MOVING_TO_PLANT_POINT
-                        self.status_text = f"Plant #1 done, move to #2 by AB={ab_cm:.1f} cm"
+                        self.status_text = f"Plant #1 done, move to #2 by C={c_cm:.1f} cm"
                         continue
-                    logger.warning("AB distance from AprilTag is <=0, skip 2nd planting move")
+                    logger.warning("C spacing from AprilTag is <=0, skip 2nd planting move")
 
                 if self.april_info is not None and self._plants_done_current_pair == 1:
                     self._plants_done_current_pair = 2
 
                 de_cm = 0.0
-                c_cm = 0.0
                 if self.april_info is not None:
-                    c_cm = float(self.april_info.spacing_gap_cm)
                     de_cm = float(self.april_info.cabbage_interval_cm)
                 self._measure_interval_cm = max(0.0, de_cm)
                 first_measure_offset_cm = max(0.0, float(config.MOTION.plant_to_camback_point_cm))
-                first_measure_base_cm = max(0.0, c_cm)
-                first_measure_step_cm = first_measure_base_cm + first_measure_offset_cm
+                first_measure_step_cm = self._measure_interval_cm + first_measure_offset_cm
                 self.state = MissionState.MOVING_TO_MEASURE_POINT
-                if first_measure_step_cm > 0:
+                if self._measure_interval_cm > 0:
                     dist0 = self.drive.get_telemetry().distance_cm
                     self._distance_goal_cm = dist0 + first_measure_step_cm
                     self.status_text = (
                         "Move to first rear-measure point by "
-                        f"C+CamBack={first_measure_step_cm:.1f} cm "
-                        f"(C={first_measure_base_cm:.1f} + offset={first_measure_offset_cm:.1f})"
+                        f"DE+CamBack={first_measure_step_cm:.1f} cm "
+                        f"(DE={self._measure_interval_cm:.1f} + offset={first_measure_offset_cm:.1f})"
                     )
                 else:
                     self._distance_goal_cm = self.drive.get_telemetry().distance_cm
-                    self.status_text = "C invalid, measure at current position"
+                    self.status_text = "DE invalid, measure at current position"
                 continue
 
             if self.state == MissionState.MOVING_TO_MEASURE_POINT:

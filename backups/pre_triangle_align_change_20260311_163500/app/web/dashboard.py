@@ -53,13 +53,6 @@ class DashboardServer:
             ok, msg = self.orchestrator.manual_drive_distance(distance_cm)
             return jsonify({"ok": ok, "message": msg, "distance_cm": distance_cm})
 
-        @self.app.route("/api/tuning/manual-distance", methods=["POST"])
-        def api_tuning_manual_distance():
-            payload = request.get_json(silent=True) or {}
-            norm = payload.get("norm")
-            ok, msg = self.orchestrator.set_manual_drive_distance_norm(norm)
-            return jsonify({"ok": ok, "message": msg, "norm": norm, "tuning": self.orchestrator.get_runtime_tuning()})
-
         @self.app.route("/api/plant/run", methods=["POST"])
         def api_plant_run():
             ok, msg = self.orchestrator.run_planting_process()
@@ -87,7 +80,6 @@ class DashboardServer:
             snap["drive_link"] = self.orchestrator.drive.get_status()
             snap["camera"] = self.orchestrator.get_camera_info()
             snap["imu"] = self.orchestrator.drive.get_imu_status()
-            snap["tuning"] = self.orchestrator.get_runtime_tuning()
             return jsonify(snap)
 
         @self.app.route("/api/config")
@@ -322,12 +314,6 @@ class DashboardServer:
       <div class="subtitle">Positive = forward, negative = backward</div>
     </div>
 
-    <div class="toolbar-tight">
-      <input id="driveSpeedNorm" type="number" min="0.05" max="1.0" step="0.01" value="0.24" placeholder="Drive speed norm" />
-      <button onclick="setDriveSpeedNorm()">Set Drive Speed</button>
-      <div class="subtitle">Affects Drive By Distance and triangle move1</div>
-    </div>
-
     <div class="overview">
       <div class="stat-card"><div class="stat-label">Mission State</div><div class="stat-value" id="ovState">-</div><div class="stat-meta" id="ovRunning">-</div></div>
       <div class="stat-card"><div class="stat-label">Status</div><div class="stat-value" id="ovStatus">-</div><div class="stat-meta" id="ovTarget">-</div></div>
@@ -443,19 +429,6 @@ class DashboardServer:
       });
       const data = await r.json();
       if (!data.ok) console.error('manual distance failed:', data.message);
-      await refresh();
-    }
-
-    async function setDriveSpeedNorm() {
-      const el = document.getElementById('driveSpeedNorm');
-      const norm = Number(el.value);
-      const r = await fetch('/api/tuning/manual-distance', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ norm })
-      });
-      const data = await r.json();
-      if (!data.ok) console.error('set drive speed failed:', data.message);
       await refresh();
     }
 
@@ -581,15 +554,9 @@ class DashboardServer:
           ['Target', data.target_class || '-'],
           ['Camera', `front=${data.camera?.effective_front_source || '-'} rear=${data.camera?.effective_rear_source || '-'}`],
           ['Drive RPM', `L ${fmt(data.drive?.left_rpm)} / R ${fmt(data.drive?.right_rpm)}`],
-          ['Drive Speed', fmt(data.tuning?.manual_drive_distance_norm)],
           ['IMU', data.imu?.connected ? `heading ${fmt(data.imu?.heading_deg, ' deg')}` : 'not connected'],
           ['AprilTag Pose', data.apriltag_yaw_measurement ? `yaw ${fmt(data.apriltag_yaw_measurement.yaw_practical_deg ?? data.apriltag_yaw_measurement.yaw_deg, ' deg')}` : 'no measurement'],
         ]);
-
-        const driveSpeedEl = document.getElementById('driveSpeedNorm');
-        if (driveSpeedEl && document.activeElement !== driveSpeedEl && data.tuning?.manual_drive_distance_norm !== undefined) {
-          driveSpeedEl.value = Number(data.tuning.manual_drive_distance_norm).toFixed(2);
-        }
 
         const core = {
           state: data.state,
@@ -600,7 +567,6 @@ class DashboardServer:
           apriltag_yaw_measurement: data.apriltag_yaw_measurement,
           drive: data.drive,
           imu: data.imu,
-          tuning: data.tuning,
           actuator: {
             connected: data.actuator?.connected,
             servo_cam_deg: data.actuator?.servo_cam_deg,

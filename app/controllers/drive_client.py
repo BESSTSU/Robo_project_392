@@ -38,22 +38,43 @@ class DriveClient:
             self._probe_protocol()
         return ok
 
-    def _find_line_after(self, after_seq: int, contains: tuple[str, ...], timeout_sec: float) -> str | None:
+    def _find_line_after(
+        self,
+        after_seq: int,
+        contains: tuple[str, ...],
+        timeout_sec: float,
+        *,
+        startswith: tuple[str, ...] = (),
+        exclude_contains: tuple[str, ...] = (),
+    ) -> str | None:
         needles = tuple(c.upper() for c in contains if c)
+        prefixes = tuple(c.upper() for c in startswith if c)
+        excluded = tuple(c.upper() for c in exclude_contains if c)
         deadline = time.monotonic() + max(0.1, float(timeout_sec))
         while time.monotonic() < deadline:
             with self._lock:
                 for seq, line in reversed(self._rx_history):
                     if seq <= after_seq:
                         break
-                    if any(n in line.upper() for n in needles):
+                    upper = line.upper()
+                    if prefixes and not any(upper.startswith(prefix) for prefix in prefixes):
+                        continue
+                    if excluded and any(token in upper for token in excluded):
+                        continue
+                    if any(n in upper for n in needles):
                         return line
             time.sleep(0.02)
         return None
 
     @staticmethod
     def _parse_caps_csv(value: str) -> set[str]:
-        return {tok.strip().upper() for tok in value.replace(" ", "").split(",") if tok.strip()}
+        known = {"VEL", "ODO_RESET", "STOP", "STATUS", "IMU_STATUS", "PROTO_VER", "HELP"}
+        caps = set()
+        for tok in value.replace(" ", "").split(","):
+            norm = tok.strip().upper()
+            if norm in known:
+                caps.add(norm)
+        return caps
 
     def _probe_protocol(self) -> None:
         """
@@ -65,10 +86,17 @@ class DriveClient:
         self.protocol_raw = ""
         self._caps_known = False
 
+        self.link.reset_input_buffer()
         seq0 = self.get_rx_seq()
         ok, _ = self.link.send_line("PROTO_VER")
         if ok:
-            line = self._find_line_after(seq0, ("DRV_PROTO", "DRV_ERR UNKNOWN:PROTO_VER"), 0.6)
+            line = self._find_line_after(
+                seq0,
+                ("DRV_PROTO", "DRV_ERR UNKNOWN:PROTO_VER"),
+                3.0,
+                startswith=("DRV_PROTO", "DRV_ERR"),
+                exclude_contains=("DRV_STAT",),
+            )
             if line and line.upper().startswith("DRV_PROTO"):
                 self.protocol_raw = line
                 m_ver = re.search(r"VER[:=]\s*([0-9A-Z._-]+)", line, flags=re.IGNORECASE)
@@ -81,10 +109,17 @@ class DriveClient:
                 logger.info("Drive protocol detected: ver=%s caps=%s", self.protocol_version, sorted(self.protocol_caps))
                 return
 
+        self.link.reset_input_buffer()
         seq1 = self.get_rx_seq()
         ok, _ = self.link.send_line("HELP")
         if ok:
-            line = self._find_line_after(seq1, ("COMMANDS:", "DRV_ERR UNKNOWN:HELP"), 0.6)
+            line = self._find_line_after(
+                seq1,
+                ("COMMANDS:", "DRV_ERR UNKNOWN:HELP"),
+                3.0,
+                startswith=("COMMANDS:", "DRV_ERR"),
+                exclude_contains=("DRV_STAT",),
+            )
             if line and "COMMANDS:" in line.upper():
                 up = line.upper()
                 caps: set[str] = set()
@@ -249,7 +284,7 @@ class DriveClient:
                 start_seq = self._rx_seq
         else:
             start_seq = int(after_seq)
-        return self._find_line_after(start_seq, ("DRV_STAT",), timeout_sec)
+        return self._find_line_after(start_seq, ("DRV_STAT",), timeout_sec, startswith=("DRV_STAT",))
 
     def get_telemetry(self) -> DriveTelemetry:
         with self._lock:
